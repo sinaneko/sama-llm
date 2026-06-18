@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Viana - AI Chat System</title>
+    <link rel="stylesheet" href="style.css">
+    
+    <!-- Favicon - Multiple formats for better browser support -->
+    <link rel="icon" type="image/svg+xml" href="logo.svg">
+    <link rel="alternate icon" type="image/png" href="logo.png">
+    <link rel="shortcut icon" href="logo.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="logo.svg">
+    <meta name="theme-color" content="#1f4e78">
+    
+    <!-- MathJax for LaTeX math rendering -->
+    <script>
+        MathJax = {
+            tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']],
+                displayMath: [['$$', '$$'], ['\\[', '\\]']],
+                processEscapes: true,
+                processEnvironments: true
+            },
+            options: {
+                skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre']
+            },
+            svg: {
+                fontCache: 'global'
+            }
+        };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" id="MathJax-script" async></script>
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar for file upload and management -->
+        <aside class="sidebar">
+            <div class="logo-section">
+                <img src="logo.svg" alt="Viana Logo" class="logo" onerror="this.style.display='none'">
+                <h1>Viana</h1>
+                <p class="subtitle">AI Chat System</p>
+            </div>
+
+            <!-- File upload section -->
+            <div class="upload-section">
+                <h3>📄 Upload Document</h3>
+                <label class="upload-label">
+                    <input type="file" id="fileInput" accept=".pdf,.jpg,.jpeg,.png,.tiff,.bmp" multiple>
+                    <span>Choose file or drag here</span>
+                </label>
+                <div id="uploadStatus" class="upload-status"></div>
+            </div>
+
+            <!-- List of uploaded files -->
+            <div class="files-section">
+                <h3>📋 Uploaded Files</h3>
+                <ul id="filesList" class="files-list">
+                    <li class="empty">No files uploaded</li>
+                </ul>
+            </div>
+
+            <!-- Action buttons -->
+            <div class="action-buttons">
+                <button id="clearBtn" class="btn-secondary">🗑️ Clear All</button>
+            </div>
+        </aside>
+
+        <!-- Main chat interface -->
+        <main class="chat-container">
+            <!-- Header with status -->
+            <header class="chat-header">
+                <div class="header-content">
+                    <h2>Chat with Viana</h2>
+                    <p>Ask questions about your uploaded documents</p>
+                </div>
+                <div class="status-indicator">
+                    <span class="status-dot"></span>
+                    <span id="statusText">Ready</span>
+                </div>
+            </header>
+
+            <!-- Messages display area -->
+            <div class="messages-area" id="messagesArea">
+                <div class="welcome-message">
+                    <img src="logo.svg" alt="Viana" class="welcome-logo" onerror="this.outerHTML='<div class=\'welcome-logo\' style=\'font-size: 80px;\'>🤖</div>'">
+                    <h3>Welcome to Viana</h3>
+                    <p>Upload a document and ask questions about it</p>
+                    <p class="hint">💡 Example: What topics are covered in this document?</p>
+                </div>
+            </div>
+
+            <!-- Chat input footer -->
+            <footer class="chat-footer">
+                <form id="chatForm" class="input-form">
+                    <textarea 
+                        id="messageInput" 
+                        placeholder="Type your question here... (Shift+Enter for new line)" 
+                        autocomplete="off"
+                        rows="1"
+                    ></textarea>
+                    <button type="submit" id="sendBtn" class="send-btn">
+                        <span>Send</span>
+                        <span class="send-icon">➤</span>
+                    </button>
+                </form>
+                <p class="footer-hint">Powered by A.N.R</p>
+            </footer>
+        </main>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
