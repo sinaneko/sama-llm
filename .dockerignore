@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.git/
+.DS_Store
+doc/
+frontend/
+# نکته: llm_script_final.py عمداً اینجا نیست تا Dockerfile.full بتواند آن را COPY کند.
+# (ایمیج سبک app_ask فقط app_ask.py را COPY می‌کند، پس این فایل واردش نمی‌شود.)

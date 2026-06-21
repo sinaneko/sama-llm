@@ -1,1 +1,1408 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.12.13","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"none","dataSources":[],"dockerImageVersionId":28755,"isInternetEnabled":false,"language":"python","sourceType":"notebook","isGpuEnabled":false}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"\"\"\"\nLLM + RAG Server with FastAPI\nPersian document question-answering system using Qwen2.5-7B and FAISS\n\"\"\"\n\n# ===== Installation (run once before starting) =====\n# pip install transformers accelerate gradio websockets fastapi uvicorn\n# pip install faiss-cpu sentence-transformers\n# pip install opencv-python numpy pytesseract pdf2image\n# pip install opencv-python-headless arabic-reshaper pdfplumber python-bidi\n# pip install mysql-connector-python pyngrok\n# apt-get install poppler-utils tesseract-ocr tesseract-ocr-fas\n\n# ===== Built-in =====\nimport os\nimport re\nimport time\nimport json\nimport shutil\nimport asyncio\nimport threading\nfrom threading import Thread\nfrom typing import List, Dict, Any\nfrom datetime import datetime\n\n# ===== ML / AI =====\nimport torch\nimport faiss\nfrom transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer\nfrom sentence_transformers import SentenceTransformer\n\n# ===== OCR / Files =====\nimport pytesseract\nfrom PIL import Image\nfrom pdf2image import convert_from_path\n\n# ===== Backend / API =====\nfrom fastapi import FastAPI, Request, UploadFile, File\nfrom fastapi.middleware.cors import CORSMiddleware\nfrom fastapi.responses import StreamingResponse, JSONResponse\nimport uvicorn\nimport gradio as gr\n\n# ===== Database =====\nimport mysql.connector\n\n# ===== Tunnel =====\nfrom pyngrok import ngrok\n\n\n# ===========================================================\n# Model & Embedder Initialization\n# ===========================================================\n\nembedder = SentenceTransformer(\"heydariAI/persian-embeddings\")\nmodel_name = \"Qwen/Qwen2.5-7B-Instruct\"\ntokenizer = AutoTokenizer.from_pretrained(model_name)\nmodel = AutoModelForCausalLM.from_pretrained(\n    model_name,\n    torch_dtype=torch.float16,\n    device_map=\"auto\"\n)\n\n\n# ===========================================================\n# Global State\n# ===========================================================\n\nextracted_texts: List[str] = []  # Stores chunks, not full documents\nmetadata: List[Dict[str, Any]] = []  # Metadata for each chunk\ndoc_embs = None\nindex = None\n\nCHUNK_SIZE = 512       # Number of characters per chunk\nCHUNK_OVERLAP = 100    # Overlap between chunks to preserve context\n\nUPLOAD_DIR = \"doc\"\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\n\n# ===========================================================\n# Text Chunking\n# ===========================================================\n\ndef chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:\n    \"\"\"Split text into smaller overlapping chunks.\"\"\"\n    if not text or len(text) <= chunk_size:\n        return [text] if text else []\n\n    chunks = []\n    start = 0\n\n    while start < len(text):\n        end = start + chunk_size\n\n        if end < len(text):\n            best_break = -1\n            for sep in ['. ', '؟ ', '! ', '\\n', '، ']:\n                last_sep = text[start:end].rfind(sep)\n                if last_sep > best_break and last_sep > chunk_size // 2:\n                    best_break = last_sep\n\n            if best_break > 0:\n                end = start + best_break + 1\n\n        chunk = text[start:end].strip()\n        if chunk:\n            chunks.append(chunk)\n\n        start = end - overlap if end < len(text) else len(text)\n\n    return chunks\n\n\ndef chunk_text_by_pages(pages_text: List[str], chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Dict]:\n    \"\"\"Split page texts into chunks, preserving page information.\"\"\"\n    all_chunks = []\n\n    for page_num, page_text in enumerate(pages_text, 1):\n        if not page_text or not page_text.strip():\n            continue\n\n        page_chunks = chunk_text(page_text, chunk_size, overlap)\n\n        for chunk_idx, chunk in enumerate(page_chunks):\n            all_chunks.append({\n                'text': chunk,\n                'page': page_num,\n                'chunk_index': chunk_idx\n            })\n\n    return all_chunks\n\n\n# ===========================================================\n# Database (for future use)\n# ===========================================================\n\ndef get_db_connection():\n    \"\"\"Connect to MySQL database.\"\"\"\n    return mysql.connector.connect(\n        host=\"localhost\",\n        user=\"root\",\n        password=\"your_password\",\n        database=\"documents_db\"\n    )\n\n\ndef get_documents_from_db() -> List[Dict[str, Any]]:\n    \"\"\"Read document list from database (for future use).\"\"\"\n    connection = get_db_connection()\n    cursor = connection.cursor(dictionary=True)\n\n    query = \"\"\"\n        SELECT id, filename, filepath, file_size, file_type,\n               created_at, updated_at, description\n        FROM documents\n        ORDER BY created_at DESC\n    \"\"\"\n\n    cursor.execute(query)\n    results = cursor.fetchall()\n    cursor.close()\n    connection.close()\n\n    return results\n\n\n# ===========================================================\n# Document Management\n# ===========================================================\n\ndef get_documents_from_folder(folder_path: str = UPLOAD_DIR) -> List[Dict[str, Any]]:\n    \"\"\"Read file list from the upload folder.\"\"\"\n    documents = []\n\n    if not os.path.exists(folder_path):\n        return documents\n\n    supported_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.bmp']\n\n    for idx, filename in enumerate(os.listdir(folder_path), 1):\n        filepath = os.path.join(folder_path, filename)\n\n        if not os.path.isfile(filepath):\n            continue\n\n        ext = os.path.splitext(filename)[1].lower()\n        if ext not in supported_extensions:\n            continue\n\n        file_stat = os.stat(filepath)\n        file_type = \"application/pdf\" if ext == '.pdf' else f\"image/{ext[1:]}\"\n\n        documents.append({\n            \"id\": idx,\n            \"filename\": filename,\n            \"filepath\": filepath,\n            \"file_size\": file_stat.st_size,\n            \"file_type\": file_type,\n            \"created_at\": datetime.fromtimestamp(file_stat.st_ctime),\n            \"updated_at\": datetime.fromtimestamp(file_stat.st_mtime),\n            \"description\": \"\"\n        })\n\n    return documents\n\n\n# ===========================================================\n# OCR & Text Extraction\n# ===========================================================\n\ndef clean_persian_text(text: str) -> str:\n    \"\"\"Clean and normalize Persian text.\"\"\"\n    lines = [line.strip() for line in text.split('\\n') if line.strip()]\n    cleaned_text = ' '.join(lines)\n    cleaned_text = re.sub(r'\\s+', ' ', cleaned_text)\n    return cleaned_text.strip()\n\n\ndef extract_text_from_pdf_by_pages(pdf_path: str, language: str = 'fas') -> List[str]:\n    \"\"\"Extract Persian text from PDF using OCR, page by page.\"\"\"\n    if not os.path.exists(pdf_path):\n        print(f\"⚠️  فایل پیدا نشد: {pdf_path}\")\n        return []\n\n    try:\n        print(f\"🔄 در حال پردازش: {pdf_path}\")\n        images = convert_from_path(pdf_path, dpi=300)\n        pages_text = []\n\n        for i, image in enumerate(images, 1):\n            print(f\"  📄 صفحه {i}/{len(images)}\")\n            text = pytesseract.image_to_string(image, lang=language)\n            cleaned_text = clean_persian_text(text) if text.strip() else \"\"\n            pages_text.append(cleaned_text)\n\n        total_chars = sum(len(p) for p in pages_text)\n        print(f\"✅ استخراج کامل شد - {len(images)} صفحه - {total_chars} کاراکتر\")\n        return pages_text\n\n    except Exception as e:\n        print(f\"❌ خطا در پردازش {pdf_path}: {str(e)}\")\n        return []\n\n\ndef extract_text_from_pdf(pdf_path: str, language: str = 'fas') -> str:\n    \"\"\"Extract text from PDF (compatibility wrapper).\"\"\"\n    pages = extract_text_from_pdf_by_pages(pdf_path, language)\n    return \"\\n\\n\".join(pages)\n\n\ndef extract_text_from_image(image_path: str, language: str = 'fas') -> str:\n    \"\"\"Extract Persian text from an image file.\"\"\"\n    if not os.path.exists(image_path):\n        print(f\"⚠️  فایل پیدا نشد: {image_path}\")\n        return \"\"\n\n    try:\n        print(f\"🔄 در حال پردازش تصویر: {image_path}\")\n        image = Image.open(image_path)\n        text = pytesseract.image_to_string(image, lang=language)\n        print(f\"✅ استخراج کامل شد - {len(text)} کاراکتر\")\n        return text.strip()\n\n    except Exception as e:\n        print(f\"❌ خطا در پردازش {image_path}: {str(e)}\")\n        return \"\"\n\n\ndef extract_chunks_from_file(filepath: str, language: str = 'fas') -> List[Dict]:\n    \"\"\"Extract and chunk text from a file.\"\"\"\n    ext = os.path.splitext(filepath)[1].lower()\n\n    if ext == '.pdf':\n        pages_text = extract_text_from_pdf_by_pages(filepath, language)\n        if pages_text:\n            return chunk_text_by_pages(pages_text)\n        return []\n\n    elif ext in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp']:\n        text = extract_text_from_image(filepath, language)\n        if text:\n            cleaned = clean_persian_text(text)\n            chunks = chunk_text(cleaned)\n            return [{'text': c, 'page': 1, 'chunk_index': i} for i, c in enumerate(chunks)]\n        return []\n\n    else:\n        print(f\"⚠️  نوع فایل پشتیبانی نمی‌شود: {ext}\")\n        return []\n\n\ndef extract_text_from_file(filepath: str, language: str = 'fas') -> str:\n    \"\"\"Extract text from file (compatibility wrapper).\"\"\"\n    ext = os.path.splitext(filepath)[1].lower()\n\n    if ext == '.pdf':\n        text = extract_text_from_pdf(filepath, language)\n    elif ext in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp']:\n        text = extract_text_from_image(filepath, language)\n    else:\n        print(f\"⚠️  نوع فایل پشتیبانی نمی‌شود: {ext}\")\n        return \"\"\n\n    return clean_persian_text(text) if text else \"\"\n\n\n# ===========================================================\n# FAISS Index Management\n# ===========================================================\n\ndef rebuild_index():\n    \"\"\"Rebuild FAISS index from all extracted chunks.\"\"\"\n    global doc_embs, index\n\n    if not extracted_texts:\n        print(\"⚠️  هیچ متنی برای ایندکس‌گذاری وجود ندارد\")\n        doc_embs = None\n        index = None\n        return\n\n    print(f\"🔄 در حال ایجاد embedding برای {len(extracted_texts)} chunk...\")\n    doc_embs = embedder.encode(extracted_texts, normalize_embeddings=True, show_progress_bar=True)\n    print(f\"✅ Embedding ایجاد شد - شکل: {doc_embs.shape}\")\n\n    index = faiss.IndexFlatIP(doc_embs.shape[1])\n    index.add(doc_embs)\n    print(f\"✅ ایندکس FAISS ساخته شد با {index.ntotal} chunk\")\n\n\ndef add_document_to_index(filepath: str, language: str = 'fas') -> bool:\n    \"\"\"Add a new document to the index with chunking.\"\"\"\n    global extracted_texts, metadata\n\n    filename = os.path.basename(filepath)\n\n    for m in metadata:\n        if m['filename'] == filename:\n            print(f\"⚠️  فایل {filename} قبلاً اضافه شده است\")\n            return False\n\n    chunks = extract_chunks_from_file(filepath, language)\n\n    if not chunks:\n        print(f\"⚠️  متنی از {filename} استخراج نشد\")\n        return False\n\n    file_stat = os.stat(filepath)\n\n    for chunk_data in chunks:\n        extracted_texts.append(chunk_data['text'])\n        metadata.append({\n            'filename': filename,\n            'filepath': filepath,\n            'page': chunk_data['page'],\n            'chunk_index': chunk_data['chunk_index'],\n            'created_at': datetime.fromtimestamp(file_stat.st_ctime),\n            'text_length': len(chunk_data['text'])\n        })\n\n    rebuild_index()\n    print(f\"✅ سند {filename} با {len(chunks)} chunk اضافه شد\")\n    return True\n\n\ndef remove_document_from_index(filename: str) -> bool:\n    \"\"\"Remove all chunks of a document from the index.\"\"\"\n    global extracted_texts, metadata\n\n    indices_to_remove = [i for i, m in enumerate(metadata) if m['filename'] == filename]\n\n    if not indices_to_remove:\n        print(f\"⚠️  فایل {filename} در ایندکس پیدا نشد\")\n        return False\n\n    for i in reversed(indices_to_remove):\n        extracted_texts.pop(i)\n        metadata.pop(i)\n\n    rebuild_index()\n    print(f\"✅ سند {filename} با {len(indices_to_remove)} chunk حذف شد\")\n    return True\n\n\ndef clear_all_documents():\n    \"\"\"Clear all documents and reset the index.\"\"\"\n    global extracted_texts, metadata, doc_embs, index\n\n    extracted_texts = []\n    metadata = []\n    doc_embs = None\n    index = None\n    print(\"✅ همه اسناد پاک شدند\")\n\n\ndef load_existing_documents(language: str = 'fas'):\n    \"\"\"Load all documents from the upload folder.\"\"\"\n    global extracted_texts, metadata\n\n    print(\"=\" * 60)\n    print(\"🚀 شروع بارگذاری اسناد موجود (با chunking)\")\n    print(\"=\" * 60)\n\n    documents = get_documents_from_folder()\n\n    if not documents:\n        print(\"⚠️  هیچ سندی در پوشه آپلود پیدا نشد\")\n        return\n\n    total_chunks = 0\n\n    for doc in documents:\n        print(f\"\\n📁 سند {doc['id']}: {doc['filename']}\")\n        chunks = extract_chunks_from_file(doc['filepath'], language)\n\n        if chunks:\n            file_stat = os.stat(doc['filepath'])\n\n            for chunk_data in chunks:\n                extracted_texts.append(chunk_data['text'])\n                metadata.append({\n                    'filename': doc['filename'],\n                    'filepath': doc['filepath'],\n                    'page': chunk_data['page'],\n                    'chunk_index': chunk_data['chunk_index'],\n                    'description': doc.get('description', ''),\n                    'created_at': doc.get('created_at'),\n                    'text_length': len(chunk_data['text'])\n                })\n\n            total_chunks += len(chunks)\n            print(f\"✅ {len(chunks)} chunk ایجاد شد\")\n\n    if extracted_texts:\n        rebuild_index()\n\n    print(\"\\n\" + \"=\" * 60)\n    print(f\"✨ بارگذاری کامل شد:\")\n    print(f\"   📄 {len(documents)} سند\")\n    print(f\"   📦 {total_chunks} chunk\")\n    print(\"=\" * 60)\n\n\ndef get_document_stats() -> Dict:\n    \"\"\"Get document and chunk statistics.\"\"\"\n    unique_files = set(m['filename'] for m in metadata)\n    return {\n        'total_documents': len(unique_files),\n        'total_chunks': len(extracted_texts),\n        'documents': list(unique_files),\n        'chunks_per_doc': {\n            f: sum(1 for m in metadata if m['filename'] == f)\n            for f in unique_files\n        }\n    }\n\n\n# ===========================================================\n# RAG Retrieval\n# ===========================================================\n\ndef retrieve_context(query, top_k=5, threshold=0.3):\n    \"\"\"Retrieve relevant chunks from the index.\"\"\"\n    if index is None or index.ntotal == 0:\n        return None, None, None, None\n\n    q_emb = embedder.encode([query], normalize_embeddings=True)\n    D, I = index.search(q_emb, min(top_k, index.ntotal))\n\n    contexts = []\n    scores = []\n    indices = []\n    source_info = []\n\n    for score, idx in zip(D[0], I[0]):\n        if idx >= 0 and score >= threshold:\n            contexts.append(extracted_texts[idx])\n            scores.append(score)\n            indices.append(idx)\n            source_info.append({\n                'filename': metadata[idx]['filename'],\n                'page': metadata[idx]['page'],\n                'score': float(score)\n            })\n\n    if not contexts:\n        return None, None, None, None\n\n    return contexts, scores, indices, source_info\n\n\ndef format_sources(source_info: List[Dict]) -> str:\n    \"\"\"Format source information for display.\"\"\"\n    if not source_info:\n        return \"\"\n\n    sources_by_file = {}\n    for s in source_info:\n        fname = s['filename']\n        if fname not in sources_by_file:\n            sources_by_file[fname] = set()\n        sources_by_file[fname].add(s['page'])\n\n    parts = []\n    for fname, pages in sources_by_file.items():\n        sorted_pages = sorted(pages)\n        if len(sorted_pages) == 1:\n            parts.append(f\"{fname} (صفحه {sorted_pages[0]})\")\n        else:\n            parts.append(f\"{fname} (صفحات {', '.join(map(str, sorted_pages))})\")\n\n    return \" | \".join(parts)\n\n\ndef debug_search(query: str, top_k: int = 5) -> None:\n    \"\"\"Print detailed search results for debugging.\"\"\"\n    print(f\"\\n{'='*60}\")\n    print(f\"🔍 سوال: {query}\")\n    print(f\"{'='*60}\\n\")\n\n    contexts, scores, indices, source_info = retrieve_context(query, top_k=top_k, threshold=0.0)\n\n    if not contexts:\n        print(\"❌ هیچ نتیجه‌ای پیدا نشد!\")\n        return\n\n    print(f\"📊 تعداد نتایج: {len(contexts)}\\n\")\n\n    for i, (ctx, score, idx, src) in enumerate(zip(contexts, scores, indices, source_info)):\n        print(f\"--- نتیجه {i+1} ---\")\n        print(f\"📁 فایل: {src['filename']}\")\n        print(f\"📄 صفحه: {src['page']}\")\n        print(f\"📈 امتیاز: {score:.4f}\")\n        print(f\"🔢 ایندکس در metadata: {idx}\")\n        print(f\"📝 متن (100 کاراکتر اول):\")\n        print(f\"   {ctx[:100]}...\")\n        print()\n\n    print(f\"{'='*60}\\n\")\n\n\ndef show_all_chunks():\n    \"\"\"Print all chunks and their metadata.\"\"\"\n    print(f\"\\n{'='*60}\")\n    print(f\"📦 لیست همه chunks در ایندکس\")\n    print(f\"{'='*60}\\n\")\n\n    if not metadata:\n        print(\"❌ هیچ chunk ای در ایندکس وجود ندارد!\")\n        return\n\n    for i, (text, meta) in enumerate(zip(extracted_texts, metadata)):\n        print(f\"[{i}] 📁 {meta['filename']} | 📄 صفحه {meta['page']} | 📊 chunk {meta['chunk_index']}\")\n        print(f\"    📝 {text[:80]}...\")\n        print()\n\n\n# ===========================================================\n# Prompt & Generation\n# ===========================================================\n\ndef build_prompt(question, contexts):\n    if contexts:\n        context_text = \"\\n\".join([f\"- {c}\" for c in contexts])\n        prompt = f\"\"\"\nYou are a helpful assistant.\nYour task is to answer the user's question using ONLY the provided Information below.\nYou must answer strictly in Persian (Farsi).\n\nExample:\nInformation:\n- پایتخت ایران تهران است.\nQuestion:\nپایتخت ایران کجاست؟\nAnswer (in Persian):\nتهران پایتخت ایران است.\n\nInformation:\n{context_text}\n\nQuestion:\n{question}\n\nAnswer (in Persian):\n\"\"\"\n    else:\n        prompt = \"\"\n\n    return prompt\n\n\ndef ask_with_rag_gradio(question, history):\n    start = time.time()\n\n    contexts, scores, indices, source_info = retrieve_context(question, top_k=5, threshold=0.3)\n\n    if not contexts:\n        yield \"اطلاعاتی در این مورد در داده‌ها موجود نیست.\"\n        return\n\n    prompt = build_prompt(question, contexts)\n    inputs = tokenizer(prompt, return_tensors=\"pt\").to(model.device)\n\n    streamer = TextIteratorStreamer(\n        tokenizer,\n        skip_prompt=True,\n        skip_special_tokens=True\n    )\n\n    generation_kwargs = dict(\n        **inputs,\n        streamer=streamer,\n        max_new_tokens=1024,\n        temperature=0.3,\n        top_p=0.95,\n        top_k=50,\n        repetition_penalty=1.0,\n        no_repeat_ngram_size=14,\n        do_sample=True\n    )\n\n    thread = Thread(target=model.generate, kwargs=generation_kwargs)\n    thread.start()\n\n    generated_text = \"\"\n    for new_text in streamer:\n        generated_text += new_text\n\n        if \"\\nInformation:\" in generated_text:\n            yield generated_text.split(\"\\nInformation:\")[0].strip()\n            return\n\n        if \"\\nExample:\" in generated_text:\n            yield generated_text.split(\"\\nExample:\")[0].strip()\n            return\n\n        yield generated_text\n\n    if source_info:\n        sources_text = format_sources(source_info)\n        yield generated_text + f\"\\n\\n📚 منابع: {sources_text}\"\n\n    elapsed = time.time() - start\n    print(f\"⏱️ مدت زمان پاسخ‌دهی: {elapsed:.2f} ثانیه\")\n\n\n# ===========================================================\n# FastAPI App\n# ===========================================================\n\napp = FastAPI()\n\napp.add_middleware(\n    CORSMiddleware,\n    allow_origins=[\"*\"],\n    allow_credentials=True,\n    allow_methods=[\"*\"],\n    allow_headers=[\"*\"],\n)\n\n\n@app.post(\"/upload\")\nasync def upload_files(file: UploadFile = File(...)):\n    file_location = os.path.join(UPLOAD_DIR, file.filename)\n    with open(file_location, \"wb\") as buffer:\n        shutil.copyfileobj(file.file, buffer)\n    success = add_document_to_index(file_location)\n    stats = get_document_stats()\n    if success:\n        return {\n            \"filename\": file.filename,\n            \"status\": \"uploaded_and_indexed\",\n            \"total_documents\": stats['total_documents'],\n            \"total_chunks\": stats['total_chunks'],\n            \"chunks_in_file\": stats['chunks_per_doc'].get(file.filename, 0)\n        }\n    else:\n        return {\n            \"filename\": file.filename,\n            \"status\": \"uploaded_but_not_indexed\",\n            \"message\": \"فایل ذخیره شد اما متنی استخراج نشد\"\n        }\n\n\n@app.get(\"/uploaded-files\")\nasync def list_files():\n    files = []\n    if os.path.exists(UPLOAD_DIR):\n        files = [f for f in os.listdir(UPLOAD_DIR) if os.path.isfile(os.path.join(UPLOAD_DIR, f))]\n    return {\"filesList\": files}\n\n\n@app.delete(\"/delete-file/{filename}\")\nasync def delete_file(filename: str):\n    file_path = os.path.join(UPLOAD_DIR, filename)\n    remove_document_from_index(filename)\n    if os.path.exists(file_path):\n        os.remove(file_path)\n    stats = get_document_stats()\n    return {\n        \"status\": \"deleted\",\n        \"filename\": filename,\n        \"total_documents\": stats['total_documents'],\n        \"total_chunks\": stats['total_chunks']\n    }\n\n\n@app.delete(\"/clear-files\")\nasync def clear_files():\n    clear_all_documents()\n    if os.path.exists(UPLOAD_DIR):\n        for f in os.listdir(UPLOAD_DIR):\n            file_path = os.path.join(UPLOAD_DIR, f)\n            if os.path.isfile(file_path):\n                os.remove(file_path)\n    return {\"status\": \"cleared\", \"total_documents\": 0, \"total_chunks\": 0}\n\n\n@app.post(\"/reindex\")\nasync def reindex_all():\n    clear_all_documents()\n    load_existing_documents()\n    stats = get_document_stats()\n    return {\n        \"status\": \"reindexed\",\n        \"total_documents\": stats['total_documents'],\n        \"total_chunks\": stats['total_chunks']\n    }\n\n\n@app.get(\"/index-status\")\nasync def index_status():\n    stats = get_document_stats()\n    return {\n        \"total_documents\": stats['total_documents'],\n        \"total_chunks\": stats['total_chunks'],\n        \"index_ready\": index is not None and index.ntotal > 0,\n        \"chunks_per_doc\": stats['chunks_per_doc'],\n        \"documents\": stats['documents']\n    }\n\n\n@app.post(\"/debug-search\")\nasync def debug_search_api(request: Request):\n    data = await request.json()\n    query = data.get('question', '')\n    top_k = data.get('top_k', 5)\n    if not query:\n        return {\"error\": \"سوال خالی است\"}\n    contexts, scores, indices, source_info = retrieve_context(query, top_k=top_k, threshold=0.0)\n    if not contexts:\n        return {\"query\": query, \"results\": [], \"message\": \"هیچ نتیجه‌ای پیدا نشد\"}\n    results = []\n    for i, (ctx, score, idx, src) in enumerate(zip(contexts, scores, indices, source_info)):\n        results.append({\n            \"rank\": i + 1,\n            \"filename\": src['filename'],\n            \"page\": src['page'],\n            \"score\": round(score, 4),\n            \"index_in_metadata\": idx,\n            \"text_preview\": ctx[:200] + \"...\" if len(ctx) > 200 else ctx,\n            \"full_text\": ctx\n        })\n    return {\"query\": query, \"total_results\": len(results), \"results\": results}\n\n\n@app.get(\"/all-chunks\")\nasync def get_all_chunks():\n    if not metadata:\n        return {\"chunks\": [], \"message\": \"هیچ chunk ای وجود ندارد\"}\n    chunks = []\n    for i, (text, meta) in enumerate(zip(extracted_texts, metadata)):\n        chunks.append({\n            \"index\": i,\n            \"filename\": meta['filename'],\n            \"page\": meta['page'],\n            \"chunk_index\": meta['chunk_index'],\n            \"text_preview\": text[:150] + \"...\" if len(text) > 150 else text\n        })\n    return {\"total_chunks\": len(chunks), \"chunks\": chunks}\n\n\nasync def stream_generator(question: str):\n    contexts, scores, indices, source_info = retrieve_context(question, top_k=5, threshold=0.3)\n\n    sources = []\n    if source_info:\n        best = source_info[0]\n        sources = [{'filename': best['filename'], 'pages': [best['page']]}]\n\n    yield f\"data: {json.dumps({'type': 'sources', 'content': sources})}\\n\\n\"\n\n    if not contexts:\n        yield f\"data: {json.dumps({'type': 'token', 'content': 'اطلاعاتی مرتبط پیدا نشد. لطفاً ابتدا فایل‌های خود را آپلود کنید.'})}\\n\\n\"\n        yield f\"data: {json.dumps({'type': 'done'})}\\n\\n\"\n        return\n\n    prompt = build_prompt(question, contexts)\n    inputs = tokenizer(prompt, return_tensors=\"pt\").to(model.device)\n\n    streamer = TextIteratorStreamer(\n        tokenizer, skip_prompt=True, skip_special_tokens=True\n    )\n\n    generation_kwargs = dict(\n        **inputs,\n        streamer=streamer,\n        max_new_tokens=1024,\n        temperature=0.3,\n        top_p=0.95,\n        top_k=50,\n        repetition_penalty=1.0,\n        no_repeat_ngram_size=14,\n        do_sample=True\n    )\n\n    thread = Thread(target=model.generate, kwargs=generation_kwargs)\n    thread.start()\n\n    generated_text = \"\"\n    for new_text in streamer:\n        generated_text += new_text\n        if \"\\nInformation:\" in generated_text:\n            break\n        if \"\\nExample:\" in generated_text:\n            break\n        yield f\"data: {json.dumps({'type': 'token', 'content': new_text})}\\n\\n\"\n\n    yield f\"data: {json.dumps({'type': 'done'})}\\n\\n\"\n\n\n@app.post(\"/chat/stream\")\nasync def chat_stream(request: Request):\n    data = await request.json()\n    question = data.get('question')\n    return StreamingResponse(stream_generator(question), media_type=\"text/event-stream\")\n\n\n# ===========================================================\n# Gradio UI\n# ===========================================================\n\nchat_ui = gr.ChatInterface(\n    fn=ask_with_rag_gradio,\n    title=\"Chat with LLM + RAG (Chunked)\",\n    description=\"چت با مدل LLM و بازیابی اطلاعات از اسناد چند صفحه‌ای (استریم فعال)\"\n)\n\n\n# ===========================================================\n# Entry Point\n# ===========================================================\n\ndef run_server():\n    uvicorn.run(app, host=\"0.0.0.0\", port=8000)\n\n\nif __name__ == \"__main__\":\n    # Load existing documents from upload folder\n    load_existing_documents(language='fas')\n\n    if index is not None:\n        stats = get_document_stats()\n        print(f\"✅ ایندکس آماده است:\")\n        print(f\"   📄 {stats['total_documents']} سند\")\n        print(f\"   📦 {stats['total_chunks']} chunk\")\n    else:\n        print(\"⚠️  هنوز سندی آپلود نشده - ایندکس خالی است\")\n        print(\"📤 برای شروع، فایل‌های PDF یا تصویر خود را آپلود کنید\")\n    \n    \n    authtoken = \"35YyIlh450CknX26vpbHbwQiteB_4sNzwasrZKBVUbp1tL4YF\"\n    if authtoken:\n        ngrok.set_auth_token(authtoken)\n        print(\"✅ ngrok authtoken set successfully!\")\n        public_url = ngrok.connect(8000)\n        print(f\"✅ ngrok tunnel established at: {public_url}\")\n    else:\n        print(\"⚠️  ngrok skipped. Server accessible at http://localhost:8000\")\n    \n    # Start FastAPI server in background thread\n    server_thread = threading.Thread(target=run_server, daemon=True)\n    server_thread.start()\n    print(\"✅ FastAPI Server running on http://localhost:8000\")\n\n    # Setup ngrok tunnel\n   ","metadata":{"_uuid":"8f2839f25d086af736a60e9eeb907d3b93b6e0e5","_cell_guid":"b1076dfc-b9ad-4769-8c92-a6c4dae69d19","trusted":true,"execution":{"iopub.status.busy":"2026-06-15T15:22:45.395931Z","iopub.execute_input":"2026-06-15T15:22:45.396622Z","iopub.status.idle":"2026-06-15T15:24:01.674952Z","shell.execute_reply.started":"2026-06-15T15:22:45.396589Z","shell.execute_reply":"2026-06-15T15:24:01.667403Z"}},"outputs":[{"name":"stderr","text":"Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\n","output_type":"stream"},{"output_type":"display_data","data":{"text/plain":"Loading weights:   0%|          | 0/391 [00:00<?, ?it/s]","application/vnd.jupyter.widget-view+json":{"version_major":2,"version_minor":0,"model_id":"22ad35691cc5495d8d3cf5a0d65a28fd"}},"metadata":{}},{"name":"stderr","text":"`torch_dtype` is deprecated! Use `dtype` instead!\n","output_type":"stream"},{"output_type":"display_data","data":{"text/plain":"Loading weights:   0%|          | 0/339 [00:00<?, ?it/s]","application/vnd.jupyter.widget-view+json":{"version_major":2,"version_minor":0,"model_id":"94f5df1a35e5492e87302a975ce6deac"}},"metadata":{}},{"name":"stdout","text":"============================================================\n🚀 شروع بارگذاری اسناد موجود (با chunking)\n============================================================\n⚠️  هیچ سندی در پوشه آپلود پیدا نشد\n⚠️  هنوز سندی آپلود نشده - ایندکس خالی است\n📤 برای شروع، فایل‌های PDF یا تصویر خود را آپلود کنید\nDownloading ngrok ...\r","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.12/dist-packages/gradio/chat_interface.py:347: UserWarning: The 'tuples' format for chatbot messages is deprecated and will be removed in a future version of Gradio. Please set type='messages' instead, which uses openai-style 'role' and 'content' keys.\n  self.chatbot = Chatbot(\n","output_type":"stream"},{"name":"stdout","text":"✅ ngrok authtoken set successfully!                                                                 \n✅ ngrok tunnel established at: NgrokTunnel: \"https://nisi-lakia-hyperprognathous.ngrok-free.dev\" -> \"http://localhost:8000\"\n✅ FastAPI Server running on http://localhost:8000\n","output_type":"stream"},{"name":"stderr","text":"INFO:     Started server process [288]\nINFO:     Waiting for application startup.\nINFO:     Application startup complete.\nINFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)\n","output_type":"stream"},{"name":"stdout","text":"INFO:     91.132.93.7:0 - \"GET / HTTP/1.1\" 404 Not Found\nINFO:     91.132.93.7:0 - \"GET /favicon.ico HTTP/1.1\" 404 Not Found\nINFO:     91.132.93.7:0 - \"OPTIONS /uploaded-files HTTP/1.1\" 200 OK\nINFO:     91.132.93.7:0 - \"GET /uploaded-files HTTP/1.1\" 200 OK\nINFO:     91.132.93.7:0 - \"OPTIONS /uploaded-files HTTP/1.1\" 200 OK\nINFO:     91.132.93.7:0 - \"OPTIONS /uploaded-files HTTP/1.1\" 200 OK\nINFO:     91.132.93.7:0 - \"GET /uploaded-files HTTP/1.1\" 200 OK\n🔄 در حال پردازش: doc/law.pdf\n❌ خطا در پردازش doc/law.pdf: Unable to get page count. Is poppler installed and in PATH?\n⚠️  متنی از law.pdf استخراج نشد\nINFO:     91.132.93.7:0 - \"POST /upload HTTP/1.1\" 200 OK\nINFO:     91.132.93.7:0 - \"OPTIONS /uploaded-files HTTP/1.1\" 200 OK\nINFO:     91.132.93.7:0 - \"GET /uploaded-files HTTP/1.1\" 200 OK\nINFO:     91.132.93.7:0 - \"OPTIONS /chat/stream HTTP/1.1\" 200 OK\nINFO:     91.132.93.7:0 - \"POST /chat/stream HTTP/1.1\" 200 OK\n","output_type":"stream"}],"execution_count":1}]}
+"""
+LLM + RAG Server with FastAPI
+Persian document question-answering system using Qwen2.5-7B and FAISS
+"""
+
+# ===== Installation (run once before starting) =====
+# pip install transformers accelerate gradio websockets fastapi uvicorn
+# pip install faiss-cpu sentence-transformers
+# pip install opencv-python numpy pytesseract pdf2image
+# pip install opencv-python-headless arabic-reshaper pdfplumber python-bidi
+# pip install mysql-connector-python
+# apt-get install poppler-utils tesseract-ocr tesseract-ocr-fas
+
+# ===== Built-in =====
+import os
+import re
+import time
+import json
+import shutil
+import secrets
+from threading import Thread
+from typing import List, Dict, Any
+from datetime import datetime
+
+# ===== ML / AI =====
+import torch
+import faiss
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from sentence_transformers import SentenceTransformer
+
+# ===== OCR / Files =====
+import pytesseract
+from PIL import Image
+from pdf2image import convert_from_path
+
+# ===== Backend / API =====
+from fastapi import FastAPI, Request, UploadFile, File, Depends, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+import uvicorn
+import gradio as gr
+
+# ===== Database =====
+import mysql.connector
+
+
+# ===========================================================
+# Model & Embedder Initialization
+# ===========================================================
+
+embedder = SentenceTransformer("heydariAI/persian-embeddings")
+model_name = "Qwen/Qwen2.5-7B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
+
+
+# ===========================================================
+# Global State
+# ===========================================================
+
+extracted_texts: List[str] = []  # Stores chunks, not full documents
+metadata: List[Dict[str, Any]] = []  # Metadata for each chunk
+doc_embs = None
+index = None
+
+CHUNK_SIZE = 512       # Number of characters per chunk
+CHUNK_OVERLAP = 100    # Overlap between chunks to preserve context
+
+UPLOAD_DIR = "doc"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+# ===========================================================
+# Text Chunking
+# ===========================================================
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    """Split text into smaller overlapping chunks."""
+    if not text or len(text) <= chunk_size:
+        return [text] if text else []
+
+    chunks = []
+    start = 0
+
+    while start < len(text):
+        end = start + chunk_size
+
+        if end < len(text):
+            best_break = -1
+            for sep in ['. ', '؟ ', '! ', '\n', '، ']:
+                last_sep = text[start:end].rfind(sep)
+                if last_sep > best_break and last_sep > chunk_size // 2:
+                    best_break = last_sep
+
+            if best_break > 0:
+                end = start + best_break + 1
+
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        start = end - overlap if end < len(text) else len(text)
+
+    return chunks
+
+
+def chunk_text_by_pages(pages_text: List[str], chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Dict]:
+    """Split page texts into chunks, preserving page information."""
+    all_chunks = []
+
+    for page_num, page_text in enumerate(pages_text, 1):
+        if not page_text or not page_text.strip():
+            continue
+
+        page_chunks = chunk_text(page_text, chunk_size, overlap)
+
+        for chunk_idx, chunk in enumerate(page_chunks):
+            all_chunks.append({
+                'text': chunk,
+                'page': page_num,
+                'chunk_index': chunk_idx
+            })
+
+    return all_chunks
+
+
+# ===========================================================
+# Database (for future use)
+# ===========================================================
+
+def get_db_connection():
+    """Connect to MySQL database."""
+    return mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="your_password",
+        database="documents_db"
+    )
+
+
+def get_documents_from_db() -> List[Dict[str, Any]]:
+    """Read document list from database (for future use)."""
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    query = """
+        SELECT id, filename, filepath, file_size, file_type,
+               created_at, updated_at, description
+        FROM documents
+        ORDER BY created_at DESC
+    """
+
+    cursor.execute(query)
+    results = cursor.fetchall()
+    cursor.close()
+    connection.close()
+
+    return results
+
+
+# ===========================================================
+# Document Management
+# ===========================================================
+
+def get_documents_from_folder(folder_path: str = UPLOAD_DIR) -> List[Dict[str, Any]]:
+    """Read file list from the upload folder."""
+    documents = []
+
+    if not os.path.exists(folder_path):
+        return documents
+
+    supported_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.bmp']
+
+    for idx, filename in enumerate(os.listdir(folder_path), 1):
+        filepath = os.path.join(folder_path, filename)
+
+        if not os.path.isfile(filepath):
+            continue
+
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in supported_extensions:
+            continue
+
+        file_stat = os.stat(filepath)
+        file_type = "application/pdf" if ext == '.pdf' else f"image/{ext[1:]}"
+
+        documents.append({
+            "id": idx,
+            "filename": filename,
+            "filepath": filepath,
+            "file_size": file_stat.st_size,
+            "file_type": file_type,
+            "created_at": datetime.fromtimestamp(file_stat.st_ctime),
+            "updated_at": datetime.fromtimestamp(file_stat.st_mtime),
+            "description": ""
+        })
+
+    return documents
+
+
+# ===========================================================
+# OCR & Text Extraction
+# ===========================================================
+
+def clean_persian_text(text: str) -> str:
+    """Clean and normalize Persian text."""
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    cleaned_text = ' '.join(lines)
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+    return cleaned_text.strip()
+
+
+def extract_text_from_pdf_by_pages(pdf_path: str, language: str = 'fas') -> List[str]:
+    """Extract Persian text from PDF using OCR, page by page."""
+    if not os.path.exists(pdf_path):
+        print(f"⚠️  فایل پیدا نشد: {pdf_path}")
+        return []
+
+    try:
+        print(f"🔄 در حال پردازش: {pdf_path}")
+        images = convert_from_path(pdf_path, dpi=300)
+        pages_text = []
+
+        for i, image in enumerate(images, 1):
+            print(f"  📄 صفحه {i}/{len(images)}")
+            text = pytesseract.image_to_string(image, lang=language)
+            cleaned_text = clean_persian_text(text) if text.strip() else ""
+            pages_text.append(cleaned_text)
+
+        total_chars = sum(len(p) for p in pages_text)
+        print(f"✅ استخراج کامل شد - {len(images)} صفحه - {total_chars} کاراکتر")
+        return pages_text
+
+    except Exception as e:
+        print(f"❌ خطا در پردازش {pdf_path}: {str(e)}")
+        return []
+
+
+def extract_text_from_pdf(pdf_path: str, language: str = 'fas') -> str:
+    """Extract text from PDF (compatibility wrapper)."""
+    pages = extract_text_from_pdf_by_pages(pdf_path, language)
+    return "\n\n".join(pages)
+
+
+def extract_text_from_image(image_path: str, language: str = 'fas') -> str:
+    """Extract Persian text from an image file."""
+    if not os.path.exists(image_path):
+        print(f"⚠️  فایل پیدا نشد: {image_path}")
+        return ""
+
+    try:
+        print(f"🔄 در حال پردازش تصویر: {image_path}")
+        image = Image.open(image_path)
+        text = pytesseract.image_to_string(image, lang=language)
+        print(f"✅ استخراج کامل شد - {len(text)} کاراکتر")
+        return text.strip()
+
+    except Exception as e:
+        print(f"❌ خطا در پردازش {image_path}: {str(e)}")
+        return ""
+
+
+def extract_chunks_from_file(filepath: str, language: str = 'fas') -> List[Dict]:
+    """Extract and chunk text from a file."""
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if ext == '.pdf':
+        pages_text = extract_text_from_pdf_by_pages(filepath, language)
+        if pages_text:
+            return chunk_text_by_pages(pages_text)
+        return []
+
+    elif ext in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp']:
+        text = extract_text_from_image(filepath, language)
+        if text:
+            cleaned = clean_persian_text(text)
+            chunks = chunk_text(cleaned)
+            return [{'text': c, 'page': 1, 'chunk_index': i} for i, c in enumerate(chunks)]
+        return []
+
+    else:
+        print(f"⚠️  نوع فایل پشتیبانی نمی‌شود: {ext}")
+        return []
+
+
+def extract_text_from_file(filepath: str, language: str = 'fas') -> str:
+    """Extract text from file (compatibility wrapper)."""
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if ext == '.pdf':
+        text = extract_text_from_pdf(filepath, language)
+    elif ext in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp']:
+        text = extract_text_from_image(filepath, language)
+    else:
+        print(f"⚠️  نوع فایل پشتیبانی نمی‌شود: {ext}")
+        return ""
+
+    return clean_persian_text(text) if text else ""
+
+
+# ===========================================================
+# FAISS Index Management
+# ===========================================================
+
+def rebuild_index():
+    """Rebuild FAISS index from all extracted chunks."""
+    global doc_embs, index
+
+    if not extracted_texts:
+        print("⚠️  هیچ متنی برای ایندکس‌گذاری وجود ندارد")
+        doc_embs = None
+        index = None
+        return
+
+    print(f"🔄 در حال ایجاد embedding برای {len(extracted_texts)} chunk...")
+    doc_embs = embedder.encode(extracted_texts, normalize_embeddings=True, show_progress_bar=True)
+    print(f"✅ Embedding ایجاد شد - شکل: {doc_embs.shape}")
+
+    index = faiss.IndexFlatIP(doc_embs.shape[1])
+    index.add(doc_embs)
+    print(f"✅ ایندکس FAISS ساخته شد با {index.ntotal} chunk")
+
+
+def add_document_to_index(filepath: str, language: str = 'fas') -> bool:
+    """Add a new document to the index with chunking."""
+    global extracted_texts, metadata
+
+    filename = os.path.basename(filepath)
+
+    for m in metadata:
+        if m['filename'] == filename:
+            print(f"⚠️  فایل {filename} قبلاً اضافه شده است")
+            return False
+
+    chunks = extract_chunks_from_file(filepath, language)
+
+    if not chunks:
+        print(f"⚠️  متنی از {filename} استخراج نشد")
+        return False
+
+    file_stat = os.stat(filepath)
+
+    for chunk_data in chunks:
+        extracted_texts.append(chunk_data['text'])
+        metadata.append({
+            'filename': filename,
+            'filepath': filepath,
+            'page': chunk_data['page'],
+            'chunk_index': chunk_data['chunk_index'],
+            'created_at': datetime.fromtimestamp(file_stat.st_ctime),
+            'text_length': len(chunk_data['text'])
+        })
+
+    rebuild_index()
+    print(f"✅ سند {filename} با {len(chunks)} chunk اضافه شد")
+    return True
+
+
+def remove_document_from_index(filename: str) -> bool:
+    """Remove all chunks of a document from the index."""
+    global extracted_texts, metadata
+
+    indices_to_remove = [i for i, m in enumerate(metadata) if m['filename'] == filename]
+
+    if not indices_to_remove:
+        print(f"⚠️  فایل {filename} در ایندکس پیدا نشد")
+        return False
+
+    for i in reversed(indices_to_remove):
+        extracted_texts.pop(i)
+        metadata.pop(i)
+
+    rebuild_index()
+    print(f"✅ سند {filename} با {len(indices_to_remove)} chunk حذف شد")
+    return True
+
+
+def clear_all_documents():
+    """Clear all documents and reset the index."""
+    global extracted_texts, metadata, doc_embs, index
+
+    extracted_texts = []
+    metadata = []
+    doc_embs = None
+    index = None
+    print("✅ همه اسناد پاک شدند")
+
+
+def load_existing_documents(language: str = 'fas'):
+    """Load all documents from the upload folder."""
+    global extracted_texts, metadata
+
+    print("=" * 60)
+    print("🚀 شروع بارگذاری اسناد موجود (با chunking)")
+    print("=" * 60)
+
+    documents = get_documents_from_folder()
+
+    if not documents:
+        print("⚠️  هیچ سندی در پوشه آپلود پیدا نشد")
+        return
+
+    total_chunks = 0
+
+    for doc in documents:
+        print(f"\n📁 سند {doc['id']}: {doc['filename']}")
+        chunks = extract_chunks_from_file(doc['filepath'], language)
+
+        if chunks:
+            file_stat = os.stat(doc['filepath'])
+
+            for chunk_data in chunks:
+                extracted_texts.append(chunk_data['text'])
+                metadata.append({
+                    'filename': doc['filename'],
+                    'filepath': doc['filepath'],
+                    'page': chunk_data['page'],
+                    'chunk_index': chunk_data['chunk_index'],
+                    'description': doc.get('description', ''),
+                    'created_at': doc.get('created_at'),
+                    'text_length': len(chunk_data['text'])
+                })
+
+            total_chunks += len(chunks)
+            print(f"✅ {len(chunks)} chunk ایجاد شد")
+
+    if extracted_texts:
+        rebuild_index()
+
+    print("\n" + "=" * 60)
+    print(f"✨ بارگذاری کامل شد:")
+    print(f"   📄 {len(documents)} سند")
+    print(f"   📦 {total_chunks} chunk")
+    print("=" * 60)
+
+
+def get_document_stats() -> Dict:
+    """Get document and chunk statistics."""
+    unique_files = set(m['filename'] for m in metadata)
+    return {
+        'total_documents': len(unique_files),
+        'total_chunks': len(extracted_texts),
+        'documents': list(unique_files),
+        'chunks_per_doc': {
+            f: sum(1 for m in metadata if m['filename'] == f)
+            for f in unique_files
+        }
+    }
+
+
+# ===========================================================
+# RAG Retrieval
+# ===========================================================
+
+def retrieve_context(query, top_k=5, threshold=0.3):
+    """Retrieve relevant chunks from the index."""
+    if index is None or index.ntotal == 0:
+        return None, None, None, None
+
+    q_emb = embedder.encode([query], normalize_embeddings=True)
+    D, I = index.search(q_emb, min(top_k, index.ntotal))
+
+    contexts = []
+    scores = []
+    indices = []
+    source_info = []
+
+    for score, idx in zip(D[0], I[0]):
+        if idx >= 0 and score >= threshold:
+            contexts.append(extracted_texts[idx])
+            scores.append(score)
+            indices.append(idx)
+            source_info.append({
+                'filename': metadata[idx]['filename'],
+                'page': metadata[idx]['page'],
+                'score': float(score)
+            })
+
+    if not contexts:
+        return None, None, None, None
+
+    return contexts, scores, indices, source_info
+
+
+def format_sources(source_info: List[Dict]) -> str:
+    """Format source information for display."""
+    if not source_info:
+        return ""
+
+    sources_by_file = {}
+    for s in source_info:
+        fname = s['filename']
+        if fname not in sources_by_file:
+            sources_by_file[fname] = set()
+        sources_by_file[fname].add(s['page'])
+
+    parts = []
+    for fname, pages in sources_by_file.items():
+        sorted_pages = sorted(pages)
+        if len(sorted_pages) == 1:
+            parts.append(f"{fname} (صفحه {sorted_pages[0]})")
+        else:
+            parts.append(f"{fname} (صفحات {', '.join(map(str, sorted_pages))})")
+
+    return " | ".join(parts)
+
+
+def debug_search(query: str, top_k: int = 5) -> None:
+    """Print detailed search results for debugging."""
+    print(f"\n{'='*60}")
+    print(f"🔍 سوال: {query}")
+    print(f"{'='*60}\n")
+
+    contexts, scores, indices, source_info = retrieve_context(query, top_k=top_k, threshold=0.0)
+
+    if not contexts:
+        print("❌ هیچ نتیجه‌ای پیدا نشد!")
+        return
+
+    print(f"📊 تعداد نتایج: {len(contexts)}\n")
+
+    for i, (ctx, score, idx, src) in enumerate(zip(contexts, scores, indices, source_info)):
+        print(f"--- نتیجه {i+1} ---")
+        print(f"📁 فایل: {src['filename']}")
+        print(f"📄 صفحه: {src['page']}")
+        print(f"📈 امتیاز: {score:.4f}")
+        print(f"🔢 ایندکس در metadata: {idx}")
+        print(f"📝 متن (100 کاراکتر اول):")
+        print(f"   {ctx[:100]}...")
+        print()
+
+    print(f"{'='*60}\n")
+
+
+def show_all_chunks():
+    """Print all chunks and their metadata."""
+    print(f"\n{'='*60}")
+    print(f"📦 لیست همه chunks در ایندکس")
+    print(f"{'='*60}\n")
+
+    if not metadata:
+        print("❌ هیچ chunk ای در ایندکس وجود ندارد!")
+        return
+
+    for i, (text, meta) in enumerate(zip(extracted_texts, metadata)):
+        print(f"[{i}] 📁 {meta['filename']} | 📄 صفحه {meta['page']} | 📊 chunk {meta['chunk_index']}")
+        print(f"    📝 {text[:80]}...")
+        print()
+
+
+# ===========================================================
+# Prompt & Generation
+# ===========================================================
+
+def build_prompt(question, contexts):
+    if contexts:
+        context_text = "\n".join([f"- {c}" for c in contexts])
+        prompt = f"""
+You are a helpful assistant.
+Your task is to answer the user's question using ONLY the provided Information below.
+You must answer strictly in Persian (Farsi).
+
+Example:
+Information:
+- پایتخت ایران تهران است.
+Question:
+پایتخت ایران کجاست؟
+Answer (in Persian):
+تهران پایتخت ایران است.
+
+Information:
+{context_text}
+
+Question:
+{question}
+
+Answer (in Persian):
+"""
+    else:
+        prompt = ""
+
+    return prompt
+
+
+def ask_with_rag_gradio(question, history):
+    start = time.time()
+
+    contexts, scores, indices, source_info = retrieve_context(question, top_k=5, threshold=0.3)
+
+    if not contexts:
+        yield "اطلاعاتی در این مورد در داده‌ها موجود نیست."
+        return
+
+    prompt = build_prompt(question, contexts)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    streamer = TextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True
+    )
+
+    generation_kwargs = dict(
+        **inputs,
+        streamer=streamer,
+        max_new_tokens=1024,
+        temperature=0.3,
+        top_p=0.95,
+        top_k=50,
+        repetition_penalty=1.0,
+        no_repeat_ngram_size=14,
+        do_sample=True
+    )
+
+    thread = Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    generated_text = ""
+    for new_text in streamer:
+        generated_text += new_text
+
+        if "\nInformation:" in generated_text:
+            yield generated_text.split("\nInformation:")[0].strip()
+            return
+
+        if "\nExample:" in generated_text:
+            yield generated_text.split("\nExample:")[0].strip()
+            return
+
+        yield generated_text
+
+    if source_info:
+        sources_text = format_sources(source_info)
+        yield generated_text + f"\n\n📚 منابع: {sources_text}"
+
+    elapsed = time.time() - start
+    print(f"⏱️ مدت زمان پاسخ‌دهی: {elapsed:.2f} ثانیه")
+
+
+# ===========================================================
+# FastAPI App
+# ===========================================================
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.post("/upload")
+async def upload_files(file: UploadFile = File(...)):
+    file_location = os.path.join(UPLOAD_DIR, file.filename)
+    with open(file_location, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    success = add_document_to_index(file_location)
+    stats = get_document_stats()
+    chunk_count = stats['chunks_per_doc'].get(file.filename, 0)
+
+    _safe_db(
+        db_upsert_document,
+        file.filename, file_location, os.path.getsize(file_location),
+        _guess_file_type(file.filename),
+        "indexed" if success else "not_indexed", chunk_count,
+        None if success else "متنی از فایل استخراج نشد",
+    )
+
+    if success:
+        return {
+            "filename": file.filename,
+            "status": "uploaded_and_indexed",
+            "total_documents": stats['total_documents'],
+            "total_chunks": stats['total_chunks'],
+            "chunks_in_file": chunk_count
+        }
+    else:
+        return {
+            "filename": file.filename,
+            "status": "uploaded_but_not_indexed",
+            "message": "فایل ذخیره شد اما متنی استخراج نشد"
+        }
+
+
+@app.get("/uploaded-files")
+async def list_files():
+    files = []
+    if os.path.exists(UPLOAD_DIR):
+        files = [f for f in os.listdir(UPLOAD_DIR) if os.path.isfile(os.path.join(UPLOAD_DIR, f))]
+    return {"filesList": files}
+
+
+@app.delete("/delete-file/{filename}")
+async def delete_file(filename: str):
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    remove_document_from_index(filename)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    _safe_db(db_delete_document, filename)
+    stats = get_document_stats()
+    return {
+        "status": "deleted",
+        "filename": filename,
+        "total_documents": stats['total_documents'],
+        "total_chunks": stats['total_chunks']
+    }
+
+
+@app.delete("/clear-files")
+async def clear_files():
+    clear_all_documents()
+    if os.path.exists(UPLOAD_DIR):
+        for f in os.listdir(UPLOAD_DIR):
+            file_path = os.path.join(UPLOAD_DIR, f)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+    return {"status": "cleared", "total_documents": 0, "total_chunks": 0}
+
+
+@app.post("/reindex")
+async def reindex_all():
+    clear_all_documents()
+    load_existing_documents()
+    stats = get_document_stats()
+    return {
+        "status": "reindexed",
+        "total_documents": stats['total_documents'],
+        "total_chunks": stats['total_chunks']
+    }
+
+
+@app.get("/index-status")
+async def index_status():
+    stats = get_document_stats()
+    return {
+        "total_documents": stats['total_documents'],
+        "total_chunks": stats['total_chunks'],
+        "index_ready": index is not None and index.ntotal > 0,
+        "chunks_per_doc": stats['chunks_per_doc'],
+        "documents": stats['documents']
+    }
+
+
+@app.post("/debug-search")
+async def debug_search_api(request: Request):
+    data = await request.json()
+    query = data.get('question', '')
+    top_k = data.get('top_k', 5)
+    if not query:
+        return {"error": "سوال خالی است"}
+    contexts, scores, indices, source_info = retrieve_context(query, top_k=top_k, threshold=0.0)
+    if not contexts:
+        return {"query": query, "results": [], "message": "هیچ نتیجه‌ای پیدا نشد"}
+    results = []
+    for i, (ctx, score, idx, src) in enumerate(zip(contexts, scores, indices, source_info)):
+        results.append({
+            "rank": i + 1,
+            "filename": src['filename'],
+            "page": src['page'],
+            "score": round(float(score), 4),
+            "index_in_metadata": int(idx),
+            "text_preview": ctx[:200] + "..." if len(ctx) > 200 else ctx,
+            "full_text": ctx
+        })
+    return {"query": query, "total_results": len(results), "results": results}
+
+
+@app.get("/all-chunks")
+async def get_all_chunks():
+    if not metadata:
+        return {"chunks": [], "message": "هیچ chunk ای وجود ندارد"}
+    chunks = []
+    for i, (text, meta) in enumerate(zip(extracted_texts, metadata)):
+        chunks.append({
+            "index": i,
+            "filename": meta['filename'],
+            "page": meta['page'],
+            "chunk_index": meta['chunk_index'],
+            "text_preview": text[:150] + "..." if len(text) > 150 else text
+        })
+    return {"total_chunks": len(chunks), "chunks": chunks}
+
+
+async def stream_generator(question: str):
+    contexts, scores, indices, source_info = retrieve_context(question, top_k=5, threshold=0.3)
+
+    sources = []
+    if source_info:
+        best = source_info[0]
+        sources = [{'filename': best['filename'], 'pages': [best['page']]}]
+
+    yield f"data: {json.dumps({'type': 'sources', 'content': sources})}\n\n"
+
+    if not contexts:
+        yield f"data: {json.dumps({'type': 'token', 'content': 'اطلاعاتی مرتبط پیدا نشد. لطفاً ابتدا فایل‌های خود را آپلود کنید.'})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return
+
+    prompt = build_prompt(question, contexts)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    streamer = TextIteratorStreamer(
+        tokenizer, skip_prompt=True, skip_special_tokens=True
+    )
+
+    generation_kwargs = dict(
+        **inputs,
+        streamer=streamer,
+        max_new_tokens=1024,
+        temperature=0.3,
+        top_p=0.95,
+        top_k=50,
+        repetition_penalty=1.0,
+        no_repeat_ngram_size=14,
+        do_sample=True
+    )
+
+    thread = Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    generated_text = ""
+    for new_text in streamer:
+        generated_text += new_text
+        if "\nInformation:" in generated_text:
+            break
+        if "\nExample:" in generated_text:
+            break
+        yield f"data: {json.dumps({'type': 'token', 'content': new_text})}\n\n"
+
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: Request):
+    data = await request.json()
+    question = data.get('question')
+    return StreamingResponse(stream_generator(question), media_type="text/event-stream")
+
+
+# ===========================================================
+# Gradio UI
+# ===========================================================
+
+chat_ui = gr.ChatInterface(
+    fn=ask_with_rag_gradio,
+    title="Chat with LLM + RAG (Chunked)",
+    description="چت با مدل LLM و بازیابی اطلاعات از اسناد چند صفحه‌ای (استریم فعال)"
+)
+
+
+# ===========================================================
+# LLM Bot API  +  Chat History Logging
+# -----------------------------------------------------------
+# این سلول یک Endpoint جدید (POST /ask) به سرور FastAPI اضافه می‌کند که:
+#   1) درخواست کاربر (user_id و question) را دریافت می‌کند،
+#   2) فعلاً بدون توجه به محتوای سؤال، همیشه پاسخ "سلام" برمی‌گرداند،
+#   3) هر گفتگو را در جدول llm_chat_history ذخیره می‌کند
+#      (شناسه کاربر، شماره ترتیبی سؤال، متن سؤال، پاسخ، زمان ثبت).
+# نکته: این سلول به متغیّرهای سراسری cell قبلی (app, Request, JSONResponse,
+#       mysql, os) متّکی است؛ پس باید بعد از سلول اصلی اجرا شود.
+# ===========================================================
+
+# ----- تنظیمات اتصال به دیتابیس (قابل‌تنظیم با متغیّر محیطی) -----
+# پیش‌فرض‌ها مطابق دیتابیس teamgram است؛ هنگام اجرا در محیط دیگر فقط
+# متغیّرهای محیطی LLM_DB_* را تنظیم کنید.
+LLM_DB_CONFIG = {
+    "host":     os.getenv("LLM_DB_HOST", "127.0.0.1"),
+    "port":     int(os.getenv("LLM_DB_PORT", "3306")),
+    "user":     os.getenv("LLM_DB_USER", "teamgram"),
+    "password": os.getenv("LLM_DB_PASSWORD", "teamgram"),
+    "database": os.getenv("LLM_DB_NAME", "teamgram"),
+}
+
+
+def get_llm_db_connection():
+    """اتصال به دیتابیسی که تاریخچهٔ گفتگوی ربات LLM در آن ذخیره می‌شود."""
+    return mysql.connector.connect(**LLM_DB_CONFIG)
+
+
+def init_llm_history_table() -> None:
+    """
+    ایجاد جدول تاریخچه در صورت عدم وجود (به‌عنوان شبکهٔ ایمنی در کنار migration).
+    این کار idempotent است و در صورت وجود جدول کاری انجام نمی‌دهد.
+    """
+    create_sql = """
+    CREATE TABLE IF NOT EXISTS llm_chat_history (
+        id              BIGINT       NOT NULL AUTO_INCREMENT,
+        user_id         BIGINT       NOT NULL,
+        question_number INT          NOT NULL,
+        question        TEXT         NOT NULL,
+        answer          TEXT         NOT NULL,
+        created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_user_id (user_id),
+        UNIQUE KEY uq_user_question (user_id, question_number)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    """
+    conn = get_llm_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(create_sql)
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def save_chat_history(user_id: int, question: str, answer: str):
+    """
+    ذخیرهٔ یک گفتگو در جدول تاریخچه و برگرداندن (شماره سؤال، زمان ثبت).
+    شماره سؤال برای هر کاربر (هر گفتگو) به‌صورت ترتیبی افزایش می‌یابد.
+    برای جلوگیری از تداخل در شرایط رقابتی از تراکنش و قفل SELECT ... FOR UPDATE
+    استفاده شده و در صورت برخورد با کلید یکتا یک‌بار دوباره تلاش می‌شود.
+    """
+    last_err = None
+    for _attempt in range(3):  # تلاش مجدد محدود در صورت رقابت روی شماره سؤال
+        conn = get_llm_db_connection()
+        try:
+            cur = conn.cursor()
+            conn.start_transaction()
+
+            # محاسبهٔ شمارهٔ سؤال بعدی برای همین کاربر
+            cur.execute(
+                "SELECT COALESCE(MAX(question_number), 0) + 1 "
+                "FROM llm_chat_history WHERE user_id = %s FOR UPDATE",
+                (user_id,),
+            )
+            question_number = int(cur.fetchone()[0])
+
+            # درج رکورد تاریخچه
+            cur.execute(
+                "INSERT INTO llm_chat_history "
+                "(user_id, question_number, question, answer) "
+                "VALUES (%s, %s, %s, %s)",
+                (user_id, question_number, question, answer),
+            )
+            conn.commit()
+            cur.close()
+            return question_number, datetime.utcnow().isoformat()
+        except mysql.connector.IntegrityError as e:
+            # شماره سؤال هم‌زمان توسط درخواست دیگری گرفته شده؛ دوباره تلاش کن
+            conn.rollback()
+            last_err = e
+        finally:
+            conn.close()
+    raise last_err if last_err else RuntimeError("ذخیرهٔ تاریخچه ناموفق بود")
+
+
+async def generate_llm_answer(question: str) -> str:
+    """
+    تولید پاسخ کامل با مصرف همان مسیر استریم (stream_generator).
+    رویدادهای SSE را می‌خواند، توکن‌های نوع «token» را به هم می‌چسباند و
+    متن نهایی را برمی‌گرداند. این‌طور منطق تولید پاسخ یک‌جا متمرکز می‌ماند.
+    """
+    answer = ""
+    async for chunk in stream_generator(question):
+        # هر chunk به شکل «data: {json}\n\n» است
+        line = chunk.strip()
+        if not line.startswith("data:"):
+            continue
+        try:
+            obj = json.loads(line[len("data:"):].strip())
+        except Exception:
+            continue
+        if obj.get("type") == "token":
+            answer += obj.get("content", "")
+        elif obj.get("type") == "done":
+            break
+
+    answer = answer.strip()
+    return answer if answer else "پاسخی تولید نشد."
+
+
+def fetch_chat_history(user_id: int = None, limit: int = 200):
+    """
+    خواندن تاریخچهٔ گفتگوها برای نمایش در پنل ادمین.
+    اگر user_id داده شود فقط گفتگوهای همان کاربر، در غیر این صورت همه.
+    خروجی: لیستی از دیکشنری‌ها (جدیدترین اول).
+    """
+    limit = max(1, min(int(limit), 1000))  # محدودیت معقول برای جلوگیری از بار زیاد
+    conn = get_llm_db_connection()
+    try:
+        cur = conn.cursor(dictionary=True)
+        if user_id is not None:
+            cur.execute(
+                "SELECT id, user_id, question_number, question, answer, created_at "
+                "FROM llm_chat_history WHERE user_id = %s "
+                "ORDER BY id DESC LIMIT %s",
+                (int(user_id), limit),
+            )
+        else:
+            cur.execute(
+                "SELECT id, user_id, question_number, question, answer, created_at "
+                "FROM llm_chat_history ORDER BY id DESC LIMIT %s",
+                (limit,),
+            )
+        rows = cur.fetchall()
+        cur.close()
+        # تبدیل datetime به رشته برای سریال‌سازی JSON
+        for r in rows:
+            if r.get("created_at") is not None:
+                r["created_at"] = str(r["created_at"])
+        return rows
+    finally:
+        conn.close()
+
+
+# ===========================================================
+# Admin Authentication (نام کاربری/رمز عبور پنل ادمین)
+# ===========================================================
+# نام کاربری و رمز عبور از متغیّرهای محیطی خوانده می‌شوند. حتماً در محیط واقعی
+# ADMIN_USERNAME و ADMIN_PASSWORD را تنظیم کنید؛ مقادیر پیش‌فرض فقط برای تست‌اند.
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin1234")
+ADMIN_TOKEN_TTL = int(os.getenv("ADMIN_TOKEN_TTL", str(12 * 3600)))  # مدت اعتبار توکن (ثانیه)
+
+# نگه‌داری توکن‌های فعال در حافظه: token -> زمان انقضا (epoch seconds).
+# با ری‌استارت سرور، کاربر باید دوباره وارد شود (برای پنل ادمین کافی است).
+_ADMIN_TOKENS: Dict[str, float] = {}
+
+
+def _issue_admin_token() -> str:
+    """ساخت یک توکن تصادفی امن و ثبت آن با زمان انقضا."""
+    token = secrets.token_urlsafe(32)
+    _ADMIN_TOKENS[token] = time.time() + ADMIN_TOKEN_TTL
+    return token
+
+
+def _token_valid(token: str) -> bool:
+    """بررسی معتبر بودن و منقضی‌نشدن توکن."""
+    exp = _ADMIN_TOKENS.get(token)
+    if exp is None:
+        return False
+    if time.time() > exp:
+        _ADMIN_TOKENS.pop(token, None)
+        return False
+    return True
+
+
+def require_admin(authorization: str = Header(None)):
+    """
+    وابستگی FastAPI برای محافظت از مسیرهای ادمین.
+    توکن باید در هدر «Authorization: Bearer <token>» ارسال شود.
+    """
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    if not token or not _token_valid(token):
+        raise HTTPException(status_code=401, detail="نیاز به ورود ادمین")
+    return token
+
+
+# ===========================================================
+# Documents DB (مدیریت فایل‌ها برای RAG)
+# ===========================================================
+
+def init_documents_table() -> None:
+    """ایجاد جدول rag_documents در صورت عدم وجود (idempotent)."""
+    create_sql = """
+    CREATE TABLE IF NOT EXISTS rag_documents (
+        id           BIGINT        NOT NULL AUTO_INCREMENT,
+        filename     VARCHAR(512)  NOT NULL,
+        filepath     VARCHAR(1024) NOT NULL,
+        file_size    BIGINT        NOT NULL DEFAULT 0,
+        file_type    VARCHAR(128)  NOT NULL DEFAULT '',
+        status       VARCHAR(32)   NOT NULL DEFAULT 'pending',
+        chunk_count  INT           NOT NULL DEFAULT 0,
+        error        TEXT          NULL,
+        created_at   TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at   TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_filename (filename)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    """
+    conn = get_llm_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(create_sql)
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def db_upsert_document(filename, filepath, file_size, file_type, status, chunk_count, error=None):
+    """درج یا به‌روزرسانی رکورد یک فایل در جدول rag_documents."""
+    conn = get_llm_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO rag_documents "
+            "(filename, filepath, file_size, file_type, status, chunk_count, error) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE "
+            "filepath=VALUES(filepath), file_size=VALUES(file_size), "
+            "file_type=VALUES(file_type), status=VALUES(status), "
+            "chunk_count=VALUES(chunk_count), error=VALUES(error)",
+            (filename, filepath, int(file_size), file_type, status, int(chunk_count), error),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def db_delete_document(filename):
+    """حذف رکورد یک فایل از جدول rag_documents."""
+    conn = get_llm_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM rag_documents WHERE filename = %s", (filename,))
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def db_list_documents():
+    """خواندن لیست فایل‌ها از جدول rag_documents (جدیدترین اول)."""
+    conn = get_llm_db_connection()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT id, filename, filepath, file_size, file_type, status, "
+            "chunk_count, error, created_at, updated_at "
+            "FROM rag_documents ORDER BY id DESC"
+        )
+        rows = cur.fetchall()
+        cur.close()
+        for r in rows:
+            for k in ("created_at", "updated_at"):
+                if r.get(k) is not None:
+                    r[k] = str(r[k])
+        return rows
+    finally:
+        conn.close()
+
+
+def _safe_db(fn, *args, **kwargs):
+    """اجرای یک عملیات دیتابیس به‌صورت best-effort؛ خطا فقط لاگ می‌شود و ایندکس را متوقف نمی‌کند."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        print(f"⚠️  عملیات دیتابیس اسناد ناموفق بود: {e}")
+        return None
+
+
+def _guess_file_type(filename: str) -> str:
+    """حدس نوع MIME ساده بر اساس پسوند فایل."""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".pdf":
+        return "application/pdf"
+    if ext in (".jpg", ".jpeg", ".png", ".tiff", ".bmp"):
+        return f"image/{ext[1:]}"
+    return ""
+
+
+def sync_documents_db():
+    """
+    هم‌گام‌سازی جدول rag_documents با وضعیت فعلی ایندکس و پوشهٔ آپلود.
+    برای هر فایل موجود در پوشه، تعداد chunk های ایندکس‌شده و وضعیت ثبت می‌شود.
+    """
+    counts: Dict[str, int] = {}
+    for m in metadata:
+        counts[m['filename']] = counts.get(m['filename'], 0) + 1
+
+    for d in get_documents_from_folder():
+        cc = counts.get(d['filename'], 0)
+        status = "indexed" if cc > 0 else "not_indexed"
+        db_upsert_document(
+            d['filename'], d['filepath'], d['file_size'], d['file_type'], status, cc, None
+        )
+
+
+# تلاش برای ساخت جدول‌ها هنگام بارگذاری ماژول (در صورت در دسترس نبودن DB، خطا نادیده گرفته می‌شود)
+try:
+    init_llm_history_table()
+    init_documents_table()
+    print("✅ جدول‌های llm_chat_history و rag_documents آماده‌اند")
+except Exception as _e:
+    print(f"⚠️  اتصال/ساخت جدول‌ها ممکن نشد (در زمان درخواست دوباره تلاش می‌شود): {_e}")
+
+
+@app.post("/ask")
+async def ask_endpoint(request: Request):
+    """
+    Endpoint اصلی ربات LLM.
+    ورودی (JSON): {"user_id": <int>, "question": "<str>"}
+    خروجی (JSON): {user_id, question_number, question, answer, created_at}
+    """
+    # ۱) خواندن و اعتبارسنجی بدنهٔ درخواست
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "بدنهٔ درخواست JSON معتبر نیست"})
+
+    user_id = data.get("user_id")
+    question = (data.get("question") or "").strip()
+
+    if user_id is None or question == "":
+        return JSONResponse(
+            status_code=422,
+            content={"error": "فیلدهای user_id و question الزامی هستند"},
+        )
+
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=422, content={"error": "user_id باید عدد باشد"})
+
+    # ۲) تولید پاسخ واقعی با RAG (از مسیر stream_generator)
+    answer = await generate_llm_answer(question)
+
+    # ۳) ذخیرهٔ تاریخچه؛ حتی اگر ذخیره ناموفق بود، پاسخ به کاربر برگردانده می‌شود
+    try:
+        question_number, created_at = save_chat_history(user_id, question, answer)
+    except Exception as e:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "user_id": user_id,
+                "question": question,
+                "answer": answer,
+                "warning": f"پاسخ تولید شد اما ذخیرهٔ تاریخچه ناموفق بود: {e}",
+            },
+        )
+
+    # ۴) پاسخ نهایی
+    return {
+        "user_id": user_id,
+        "question_number": question_number,
+        "question": question,
+        "answer": answer,
+        "created_at": created_at,
+    }
+
+
+# ===========================================================
+# پنل ادمین مشاهدهٔ پیام‌ها
+# ===========================================================
+
+# مسیر فایل HTML پنل ادمین (کنار همین اسکریپت قرار دارد).
+_PANEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_panel.html")
+
+
+@app.post("/admin/login")
+async def admin_login(request: Request):
+    """ورود ادمین. ورودی JSON: {username, password} → خروجی: {token, expires_in}."""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "بدنهٔ درخواست JSON معتبر نیست"})
+
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    user_ok = secrets.compare_digest(username, ADMIN_USERNAME)
+    pass_ok = secrets.compare_digest(password, ADMIN_PASSWORD)
+    if not (user_ok and pass_ok):
+        return JSONResponse(status_code=401, content={"error": "نام کاربری یا رمز عبور نادرست است"})
+
+    token = _issue_admin_token()
+    return {"token": token, "expires_in": ADMIN_TOKEN_TTL}
+
+
+@app.get("/history")
+async def history_endpoint(user_id: int = None, limit: int = 200, _admin: str = Depends(require_admin)):
+    """
+    خروجی JSON تاریخچهٔ گفتگوها (محافظت‌شده با ورود ادمین).
+    پارامترهای اختیاری: user_id (فیلتر کاربر)، limit (حداکثر تعداد ردیف).
+    """
+    try:
+        rows = fetch_chat_history(user_id=user_id, limit=limit)
+        return {"count": len(rows), "items": rows}
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"error": f"اتصال به دیتابیس ممکن نشد: {e}"})
+
+
+# ----- مدیریت فایل‌ها (محافظت‌شده با ورود ادمین) -----
+
+@app.get("/admin/files")
+async def admin_list_files(_admin: str = Depends(require_admin)):
+    """لیست فایل‌های مدیریت‌شده. ترجیحاً از دیتابیس؛ در صورت در دسترس نبودن، از پوشه."""
+    try:
+        rows = db_list_documents()
+        return {"source": "db", "count": len(rows), "items": rows}
+    except Exception:
+        # fallback: ساخت لیست از روی پوشه و وضعیت فعلی ایندکس
+        counts: Dict[str, int] = {}
+        for m in metadata:
+            counts[m['filename']] = counts.get(m['filename'], 0) + 1
+        items = [{
+            "filename": d["filename"],
+            "filepath": d["filepath"],
+            "file_size": d["file_size"],
+            "file_type": d["file_type"],
+            "status": "indexed" if counts.get(d["filename"], 0) > 0 else "not_indexed",
+            "chunk_count": counts.get(d["filename"], 0),
+        } for d in get_documents_from_folder()]
+        return {"source": "folder", "count": len(items), "items": items}
+
+
+@app.post("/admin/upload")
+async def admin_upload(file: UploadFile = File(...), _admin: str = Depends(require_admin)):
+    """آپلود فایل جدید توسط ادمین، افزودن به ایندکس RAG و ثبت در دیتابیس."""
+    file_location = os.path.join(UPLOAD_DIR, file.filename)
+    with open(file_location, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    success = add_document_to_index(file_location)
+    stats = get_document_stats()
+    chunk_count = stats['chunks_per_doc'].get(file.filename, 0)
+
+    file_size = os.path.getsize(file_location)
+    _safe_db(
+        db_upsert_document,
+        file.filename, file_location, file_size, _guess_file_type(file.filename),
+        "indexed" if success else "not_indexed", chunk_count,
+        None if success else "متنی از فایل استخراج نشد",
+    )
+
+    return {
+        "filename": file.filename,
+        "status": "uploaded_and_indexed" if success else "uploaded_but_not_indexed",
+        "chunks_in_file": chunk_count,
+        "total_documents": stats['total_documents'],
+        "total_chunks": stats['total_chunks'],
+    }
+
+
+@app.delete("/admin/files/{filename}")
+async def admin_delete_file(filename: str, _admin: str = Depends(require_admin)):
+    """حذف فایل از ایندکس RAG، پوشه و دیتابیس."""
+    remove_document_from_index(filename)
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    _safe_db(db_delete_document, filename)
+
+    stats = get_document_stats()
+    return {
+        "status": "deleted",
+        "filename": filename,
+        "total_documents": stats['total_documents'],
+        "total_chunks": stats['total_chunks'],
+    }
+
+
+@app.post("/admin/reindex")
+async def admin_reindex(_admin: str = Depends(require_admin)):
+    """ایندکس مجدد همهٔ فایل‌های پوشهٔ آپلود و هم‌گام‌سازی دیتابیس."""
+    clear_all_documents()
+    load_existing_documents()
+    _safe_db(sync_documents_db)
+
+    stats = get_document_stats()
+    return {
+        "status": "reindexed",
+        "total_documents": stats['total_documents'],
+        "total_chunks": stats['total_chunks'],
+    }
+
+
+@app.get("/panel", response_class=HTMLResponse)
+async def panel():
+    """صفحهٔ پنل ادمین (از فایل admin_panel.html سرو می‌شود)."""
+    try:
+        with open(_PANEL_PATH, encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="<h3>admin_panel.html یافت نشد</h3>", status_code=500)
+
+
+# ===========================================================
+# Entry Point
+# ===========================================================
+
+if __name__ == "__main__":
+    # بارگذاری اسناد موجود از پوشهٔ آپلود و افزودن همهٔ آن‌ها به RAG
+    load_existing_documents(language='fas')
+
+    # هم‌گام‌سازی دیتابیس مدیریت فایل‌ها با وضعیت فعلی ایندکس (best-effort)
+    _safe_db(sync_documents_db)
+
+    if index is not None:
+        stats = get_document_stats()
+        print("✅ ایندکس آماده است:")
+        print(f"   📄 {stats['total_documents']} سند")
+        print(f"   📦 {stats['total_chunks']} chunk")
+    else:
+        print("⚠️  هنوز سندی آپلود نشده - ایندکس خالی است")
+        print("📤 برای شروع، فایل‌های PDF یا تصویر خود را آپلود کنید")
+
+    print(f"🔐 پنل ادمین: http://localhost:8000/panel  (نام کاربری: {ADMIN_USERNAME})")
+
+    # (اختیاری) اجرای رابط گرافیکی Gradio در کنار سرور:
+    # chat_ui.launch(server_name="0.0.0.0", server_port=7860, prevent_thread_lock=True)
+
+    # اجرای سرور FastAPI در نخ اصلی (مسدودکننده تا فرایند زنده بماند)
+    print("✅ FastAPI Server running on http://localhost:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

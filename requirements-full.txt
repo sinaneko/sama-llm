@@ -1,0 +1,35 @@
+# ===========================================================
+# وابستگی‌های کامل برای اجرای llm_script_final.py
+# (نسخهٔ سنگین: RAG + LLM + OCR + Gradio)
+# نصب: pip install -r requirements-full.txt
+# هشدار: torch و مدل Qwen2.5-7B حجیم‌اند و برای اجرا GPU/RAM زیاد لازم است.
+# ===========================================================
+
+# ----- API / وب‌سرور -----
+fastapi
+uvicorn[standard]
+python-multipart          # لازم برای UploadFile در Endpoint /upload
+websockets
+
+# ----- ML / هوش مصنوعی -----
+torch                     # برای GPU، نسخهٔ CUDA مناسب را جداگانه نصب کنید
+transformers
+accelerate                # لازم برای device_map="auto"
+sentence-transformers
+faiss-cpu
+
+# ----- OCR و پردازش فایل -----
+pytesseract
+pdf2image
+pillow
+pdfplumber
+arabic-reshaper
+python-bidi
+opencv-python-headless
+numpy
+
+# ----- رابط گرافیکی -----
+gradio
+
+# ----- دیتابیس -----
+mysql-connector-python

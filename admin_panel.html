@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<!--
+  پنل ادمین ربات LLM
+  ------------------------------------
+  این فایل مستقل است و توسط سرور FastAPI روی مسیر /panel سرو می‌شود
+  (هم در app_ask.py و هم در llm_script_final.py). شامل دو بخش است:
+    ۱) مشاهدهٔ پیام‌ها (از Endpoint «/history»)
+    ۲) مدیریت فایل‌های RAG (از Endpoint‌های «/admin/files», «/admin/upload», ...)
+  ورود با نام کاربری/رمز عبور از «/admin/login» انجام می‌شود و توکن در
+  localStorage نگه‌داری شده و در هدر Authorization همهٔ درخواست‌ها ارسال می‌گردد.
+  هیچ وابستگی خارجی ندارد (HTML/CSS/JS خالص).
+-->
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>پنل ادمین — ربات LLM</title>
+<style>
+  :root { --bg:#f4f6fb; --card:#fff; --ink:#222; --muted:#6b7280; --pri:#0984e3; --line:#e5e7eb; }
+  * { box-sizing: border-box; }
+  body { font-family: Tahoma, Vazirmatn, sans-serif; margin:0; background:var(--bg); color:var(--ink); }
+  header { background:#2d3436; color:#fff; padding:14px 20px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; flex:1; }
+  .badge { background:#00b894; color:#fff; border-radius:20px; padding:3px 12px; font-size:13px; }
+  .logout { background:#636e72; color:#fff; border:none; border-radius:8px; padding:6px 12px; cursor:pointer; font-family:inherit; }
+  .logout:hover { background:#4b5557; }
+  .tabs { display:flex; gap:8px; padding:14px 20px 0; }
+  .tab { padding:9px 18px; border:none; border-radius:10px 10px 0 0; background:#dfe6ee; color:#33414f; cursor:pointer; font-family:inherit; font-size:14px; }
+  .tab.active { background:var(--card); font-weight:600; box-shadow:0 -1px 3px rgba(0,0,0,.05); }
+  .controls { background:var(--card); margin:0 20px; padding:12px 16px; border-radius:0 10px 10px 10px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; box-shadow:0 1px 3px rgba(0,0,0,.06); }
+  .controls input, .controls select, .controls button { padding:8px 11px; border-radius:8px; border:1px solid #cbd5e1; font-size:14px; font-family:inherit; }
+  .controls button { background:var(--pri); color:#fff; border:none; cursor:pointer; }
+  .controls button:hover { background:#0b76c9; }
+  .controls button.danger { background:#d63031; }
+  .controls button.danger:hover { background:#b71c1c; }
+  .controls label { font-size:13px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+  .wrap { padding:16px 20px 40px; }
+  .meta { margin:0 0 10px; font-size:13px; color:var(--muted); }
+  table { width:100%; border-collapse:collapse; background:var(--card); border-radius:10px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  th, td { padding:10px 12px; border-bottom:1px solid var(--line); text-align:right; font-size:14px; vertical-align:top; }
+  th { background:#eef2f7; font-weight:600; }
+  tr:hover td { background:#f1f9ff; }
+  td.num { text-align:center; color:var(--muted); white-space:nowrap; }
+  td.q { max-width:420px; word-break:break-word; }
+  td.ans { color:#00708a; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:12px; font-size:12px; }
+  .pill.ok { background:#d8f5e3; color:#0a8f4f; }
+  .pill.no { background:#fde2e1; color:#c0392b; }
+  .del { background:#d63031; color:#fff; border:none; border-radius:7px; padding:5px 10px; cursor:pointer; font-family:inherit; font-size:13px; }
+  .del:hover { background:#b71c1c; }
+  .empty, .err { padding:24px; text-align:center; color:var(--muted); background:var(--card); border-radius:10px; margin-top:10px; }
+  .err { color:#c0392b; }
+  .hidden { display:none !important; }
+  /* صفحهٔ ورود */
+  .login-overlay { position:fixed; inset:0; background:linear-gradient(135deg,#2d3436,#0984e3); display:flex; align-items:center; justify-content:center; z-index:50; }
+  .login-card { background:#fff; padding:30px 28px; border-radius:14px; width:340px; max-width:92vw; box-shadow:0 12px 40px rgba(0,0,0,.3); }
+  .login-card h2 { margin:0 0 4px; font-size:20px; }
+  .login-card p { margin:0 0 18px; font-size:13px; color:var(--muted); }
+  .login-card input { width:100%; padding:11px 12px; margin-bottom:12px; border:1px solid #cbd5e1; border-radius:9px; font-size:15px; font-family:inherit; }
+  .login-card button { width:100%; padding:12px; background:var(--pri); color:#fff; border:none; border-radius:9px; font-size:15px; cursor:pointer; font-family:inherit; }
+  .login-card button:hover { background:#0b76c9; }
+  .login-err { color:#c0392b; font-size:13px; min-height:18px; margin-bottom:8px; }
+</style>
+</head>
+<body>
+
+<!-- ===== صفحهٔ ورود ===== -->
+<div class="login-overlay" id="loginScreen">
+  <form class="login-card" id="loginForm" onsubmit="return doLogin(event)">
+    <h2>🔐 ورود ادمین</h2>
+    <p>برای دسترسی به پنل، نام کاربری و رمز عبور را وارد کنید.</p>
+    <div class="login-err" id="loginErr"></div>
+    <input id="username" type="text" placeholder="نام کاربری" autocomplete="username" required>
+    <input id="password" type="password" placeholder="رمز عبور" autocomplete="current-password" required>
+    <button type="submit">ورود</button>
+  </form>
+</div>
+
+<!-- ===== پنل اصلی ===== -->
+<div id="app" class="hidden">
+  <header>
+    <h1>🤖 پنل ادمین — ربات LLM</h1>
+    <span class="badge" id="badge">—</span>
+    <button class="logout" onclick="logout()">خروج</button>
+  </header>
+
+  <div class="tabs">
+    <button class="tab active" id="tabBtnMsg" onclick="switchTab('msg')">📨 پیام‌ها</button>
+    <button class="tab" id="tabBtnFiles" onclick="switchTab('files')">📁 مدیریت فایل‌ها</button>
+  </div>
+
+  <!-- تب پیام‌ها -->
+  <div id="tabMsg">
+    <div class="controls">
+      <input id="uid" type="text" placeholder="فیلتر بر اساس user_id (اختیاری)">
+      <label>تعداد:
+        <select id="limit">
+          <option>100</option><option selected>300</option><option>500</option><option>1000</option>
+        </select>
+      </label>
+      <button onclick="loadHistory()">🔄 بارگذاری</button>
+      <label><input type="checkbox" id="auto"> به‌روزرسانی خودکار (۵s)</label>
+    </div>
+    <div class="wrap">
+      <div class="meta" id="metaMsg">—</div>
+      <table>
+        <thead><tr>
+          <th>#</th><th>کاربر</th><th>شماره سؤال</th><th>سؤال</th><th>پاسخ</th><th>زمان ثبت</th>
+        </tr></thead>
+        <tbody id="rowsMsg"></tbody>
+      </table>
+      <div class="empty hidden" id="emptyMsg">هیچ پیامی ثبت نشده است.</div>
+      <div class="err hidden" id="errMsg"></div>
+    </div>
+  </div>
+
+  <!-- تب مدیریت فایل‌ها -->
+  <div id="tabFiles" class="hidden">
+    <div class="controls">
+      <input id="fileInput" type="file" accept=".pdf,.jpg,.jpeg,.png,.tiff,.bmp">
+      <button onclick="uploadFile()">⬆️ آپلود و افزودن به RAG</button>
+      <button onclick="loadFiles()">🔄 بارگذاری</button>
+      <button class="danger" onclick="reindexAll()">♻️ ایندکس مجدد همه</button>
+    </div>
+    <div class="wrap">
+      <div class="meta" id="metaFiles">—</div>
+      <table>
+        <thead><tr>
+          <th>نام فایل</th><th>نوع</th><th>حجم</th><th>وضعیت</th><th>تعداد chunk</th><th>عملیات</th>
+        </tr></thead>
+        <tbody id="rowsFiles"></tbody>
+      </table>
+      <div class="empty hidden" id="emptyFiles">هیچ فایلی موجود نیست.</div>
+      <div class="err hidden" id="errFiles"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// مبدأ API: پیش‌فرض هم‌مبدأ. برای باز کردن مستقیم فایل می‌توان ?api=http://host:8000 افزود.
+const API = new URLSearchParams(location.search).get('api') || '';
+const TOKEN_KEY = 'llm_admin_token';
+
+function getToken(){ return localStorage.getItem(TOKEN_KEY) || ''; }
+function setToken(t){ localStorage.setItem(TOKEN_KEY, t); }
+function clearToken(){ localStorage.removeItem(TOKEN_KEY); }
+
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function fmtSize(b){ b=Number(b)||0; if(b<1024) return b+' B'; if(b<1048576) return (b/1024).toFixed(1)+' KB'; return (b/1048576).toFixed(1)+' MB'; }
+
+// fetch با هدر توکن؛ در صورت 401 خودکار خارج می‌شود.
+async function authFetch(path, opts={}){
+  opts.headers = Object.assign({}, opts.headers, { 'Authorization': 'Bearer ' + getToken() });
+  const res = await fetch(API + path, opts);
+  if (res.status === 401){ logout(); throw new Error('نشست منقضی شده؛ دوباره وارد شوید.'); }
+  return res;
+}
+
+// ---------- ورود / خروج ----------
+async function doLogin(ev){
+  ev.preventDefault();
+  const errEl = document.getElementById('loginErr');
+  errEl.textContent = '';
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value;
+  try {
+    const res = await fetch(API + '/admin/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const data = await res.json();
+    if (!res.ok){ errEl.textContent = data.error || ('خطا: ' + res.status); return false; }
+    setToken(data.token);
+    showApp();
+  } catch(e){ errEl.textContent = 'خطا در ارتباط با سرور: ' + e; }
+  return false;
+}
+
+function logout(){
+  clearToken();
+  document.getElementById('app').classList.add('hidden');
+  document.getElementById('loginScreen').classList.remove('hidden');
+  document.getElementById('password').value = '';
+}
+
+function showApp(){
+  document.getElementById('loginScreen').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+  loadHistory();
+}
+
+// ---------- تب‌ها ----------
+function switchTab(name){
+  const isMsg = name === 'msg';
+  document.getElementById('tabMsg').classList.toggle('hidden', !isMsg);
+  document.getElementById('tabFiles').classList.toggle('hidden', isMsg);
+  document.getElementById('tabBtnMsg').classList.toggle('active', isMsg);
+  document.getElementById('tabBtnFiles').classList.toggle('active', !isMsg);
+  if (isMsg) loadHistory(); else loadFiles();
+}
+
+// ---------- پیام‌ها ----------
+async function loadHistory(){
+  const uid = document.getElementById('uid').value.trim();
+  const limit = document.getElementById('limit').value;
+  const meta = document.getElementById('metaMsg');
+  const tbody = document.getElementById('rowsMsg');
+  const empty = document.getElementById('emptyMsg');
+  const err = document.getElementById('errMsg');
+  const badge = document.getElementById('badge');
+
+  let path = '/history?limit=' + encodeURIComponent(limit);
+  if (uid) path += '&user_id=' + encodeURIComponent(uid);
+
+  try {
+    const res = await authFetch(path);
+    const data = await res.json();
+    if (!res.ok){ err.classList.remove('hidden'); err.textContent = data.error || ('خطا: '+res.status); tbody.innerHTML=''; empty.classList.add('hidden'); meta.textContent=''; return; }
+    err.classList.add('hidden');
+    const items = data.items || [];
+    badge.textContent = data.count + ' پیام';
+    meta.textContent = 'تعداد نمایش: ' + items.length + ' — آخرین به‌روزرسانی: ' + new Date().toLocaleTimeString('fa-IR');
+    empty.classList.toggle('hidden', items.length > 0);
+    tbody.innerHTML = items.map(r =>
+      '<tr><td class="num">'+esc(r.id)+'</td><td class="num">'+esc(r.user_id)+'</td>'+
+      '<td class="num">'+esc(r.question_number)+'</td><td class="q">'+esc(r.question)+'</td>'+
+      '<td class="ans">'+esc(r.answer)+'</td><td class="num">'+esc(r.created_at)+'</td></tr>'
+    ).join('');
+  } catch(e){ err.classList.remove('hidden'); err.textContent = 'خطا: ' + e.message; meta.textContent=''; }
+}
+
+// ---------- مدیریت فایل‌ها ----------
+async function loadFiles(){
+  const meta = document.getElementById('metaFiles');
+  const tbody = document.getElementById('rowsFiles');
+  const empty = document.getElementById('emptyFiles');
+  const err = document.getElementById('errFiles');
+  try {
+    const res = await authFetch('/admin/files');
+    if (res.status === 404){ err.classList.remove('hidden'); err.textContent = 'مدیریت فایل‌ها روی این سرور فعال نیست.'; tbody.innerHTML=''; empty.classList.add('hidden'); meta.textContent=''; return; }
+    const data = await res.json();
+    if (!res.ok){ err.classList.remove('hidden'); err.textContent = data.error || ('خطا: '+res.status); tbody.innerHTML=''; meta.textContent=''; return; }
+    err.classList.add('hidden');
+    const items = data.items || [];
+    meta.textContent = 'تعداد فایل‌ها: ' + items.length + ' (منبع: ' + (data.source||'-') + ')';
+    empty.classList.toggle('hidden', items.length > 0);
+    tbody.innerHTML = items.map(f => {
+      const ok = (f.status === 'indexed');
+      return '<tr><td class="q">'+esc(f.filename)+'</td>'+
+        '<td class="num">'+esc(f.file_type||'-')+'</td>'+
+        '<td class="num">'+fmtSize(f.file_size)+'</td>'+
+        '<td><span class="pill '+(ok?'ok':'no')+'">'+(ok?'ایندکس‌شده':'بدون ایندکس')+'</span></td>'+
+        '<td class="num">'+esc(f.chunk_count||0)+'</td>'+
+        '<td><button class="del" onclick="deleteFile(\''+encodeURIComponent(f.filename)+'\')">🗑 حذف</button></td></tr>';
+    }).join('');
+  } catch(e){ err.classList.remove('hidden'); err.textContent = 'خطا: ' + e.message; meta.textContent=''; }
+}
+
+async function uploadFile(){
+  const input = document.getElementById('fileInput');
+  if (!input.files.length){ alert('ابتدا یک فایل انتخاب کنید.'); return; }
+  const fd = new FormData();
+  fd.append('file', input.files[0]);
+  try {
+    const res = await authFetch('/admin/upload', { method:'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok){ alert(data.error || ('خطا در آپلود: '+res.status)); return; }
+    input.value = '';
+    alert('فایل «'+data.filename+'» آپلود شد — وضعیت: '+data.status+' ('+(data.chunks_in_file||0)+' chunk)');
+    loadFiles();
+  } catch(e){ alert('خطا: ' + e.message); }
+}
+
+async function deleteFile(encName){
+  const name = decodeURIComponent(encName);
+  if (!confirm('فایل «'+name+'» حذف شود؟')) return;
+  try {
+    const res = await authFetch('/admin/files/' + encName, { method:'DELETE' });
+    const data = await res.json();
+    if (!res.ok){ alert(data.error || ('خطا در حذف: '+res.status)); return; }
+    loadFiles();
+  } catch(e){ alert('خطا: ' + e.message); }
+}
+
+async function reindexAll(){
+  if (!confirm('همهٔ فایل‌ها دوباره ایندکس شوند؟ ممکن است کمی طول بکشد.')) return;
+  const meta = document.getElementById('metaFiles');
+  meta.textContent = 'در حال ایندکس مجدد…';
+  try {
+    const res = await authFetch('/admin/reindex', { method:'POST' });
+    const data = await res.json();
+    if (!res.ok){ alert(data.error || ('خطا: '+res.status)); return; }
+    alert('ایندکس مجدد انجام شد — '+data.total_documents+' سند، '+data.total_chunks+' chunk');
+    loadFiles();
+  } catch(e){ alert('خطا: ' + e.message); }
+}
+
+// به‌روزرسانی خودکار تب پیام‌ها
+setInterval(()=>{
+  if (getToken() && document.getElementById('auto').checked && !document.getElementById('tabMsg').classList.contains('hidden')) {
+    loadHistory();
+  }
+}, 5000);
+
+// شروع: اگر توکن داریم پنل را نشان بده، وگرنه صفحهٔ ورود.
+if (getToken()) showApp();
+</script>
+</body>
+</html>

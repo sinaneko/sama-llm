@@ -1,0 +1,41 @@
+# ===========================================================
+# ایمیج کامل برای اجرای llm_script_final.py (RAG + LLM + OCR + Gradio)
+# ساخت:  docker build -f Dockerfile.full -t llm-full .
+# اجرا :  docker run -d -p 8000:8000 \
+#            -e LLM_DB_HOST=host.docker.internal \
+#            -v llm_hf_cache:/root/.cache/huggingface \
+#            --name llm-full llm-full
+# هشدار: مدل Qwen2.5-7B هنگام اولین اجرا چند گیگابایت دانلود می‌شود و برای
+#        اجرای روان به GPU و RAM کافی نیاز دارد (روی CPU بسیار کند است).
+# ===========================================================
+FROM python:3.11-slim
+
+# وابستگی‌های سیستمی:
+#   poppler-utils            -> pdf2image (تبدیل PDF به تصویر)
+#   tesseract-ocr + fas      -> OCR فارسی
+#   libgl1 / libglib2.0-0    -> opencv
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        poppler-utils \
+        tesseract-ocr \
+        tesseract-ocr-fas \
+        libgl1 \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# نصب وابستگی‌های پایتون (لایهٔ جداگانه برای استفاده از کش داکر)
+COPY requirements-full.txt .
+RUN pip install --no-cache-dir -r requirements-full.txt
+
+# کد سرور و فایل پنل ادمین
+COPY llm_script_final.py .
+COPY admin_panel.html .
+
+# پوشهٔ آپلود اسناد (در صورت نیاز با volume جایگزین کنید)
+RUN mkdir -p /app/doc
+
+EXPOSE 8000
+
+# اجرای سرور (uvicorn روی 0.0.0.0:8000 داخل __main__ بالا می‌آید)
+CMD ["python", "llm_script_final.py"]

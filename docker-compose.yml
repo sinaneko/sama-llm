@@ -1,0 +1,78 @@
+# دو حالت اجرا:
+#
+#   ۱) نسخهٔ سبک (فقط /ask + ورود + تب پیام‌ها) — سریع:
+#        docker compose up --build
+#
+#   ۲) نسخهٔ کامل (RAG + مدیریت فایل) — سنگین (torch/faiss + دانلود مدل ۷B):
+#        docker compose up --build app-full
+#
+# هر دو روی پورت 8000 هستند ولی هم‌زمان اجرا نمی‌شوند (نسخهٔ کامل با profile جدا
+# شده تا «docker compose up» بدون آرگومان فقط نسخهٔ سبک را بالا بیاورد).
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      LLM_DB_HOST: db
+      LLM_DB_PORT: "3306"
+      LLM_DB_USER: teamgram
+      LLM_DB_PASSWORD: teamgram
+      LLM_DB_NAME: teamgram
+      # اعتبارنامهٔ ورود به پنل ادمین (حتماً در محیط واقعی تغییر دهید)
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: admin1234
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # نسخهٔ کامل با RAG و مدیریت فایل. فقط با نام صریح بالا می‌آید:
+  #   docker compose up --build app-full
+  app-full:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: Dockerfile.full
+    ports:
+      - "8000:8000"
+    environment:
+      LLM_DB_HOST: db
+      LLM_DB_PORT: "3306"
+      LLM_DB_USER: teamgram
+      LLM_DB_PASSWORD: teamgram
+      LLM_DB_NAME: teamgram
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: admin1234
+    volumes:
+      # فایل‌های آپلودی روی هاست بمانند (هنگام استارت همه به RAG اضافه می‌شوند)
+      - ./doc:/app/doc
+      # کش مدل‌های HuggingFace تا با هر بار اجرا دوباره دانلود نشود
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: teamgram
+      MYSQL_DATABASE: teamgram
+      MYSQL_USER: teamgram
+      MYSQL_PASSWORD: teamgram
+    # پورت 3306 روی هاست منتشر نمی‌شود؛ اپ از طریق شبکهٔ داخلی داکر (db:3306)
+    # وصل می‌شود. اگر می‌خواهی از بیرون (مثلاً DBeaver) وصل شوی، خط زیر را باز کن
+    # و مطمئن شو MySQL محلی دیگری روی 3306 اجرا نیست:
+    # ports:
+    #   - "3307:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pteamgram"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  db_data:
+  hf_cache:
