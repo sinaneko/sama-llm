@@ -1,16 +1,70 @@
+# syntax=docker/dockerfile:1
 # ===========================================================
 # ایمیج کامل برای اجرای llm_script_final.py (RAG + LLM + OCR + Gradio)
 # ساخت:  docker build -f Dockerfile.full -t llm-full .
 # اجرا :  docker run -d -p 8000:8000 \
 #            -e LLM_DB_HOST=host.docker.internal \
-#            -v llm_hf_cache:/root/.cache/huggingface \
 #            --name llm-full llm-full
-# هشدار: مدل Qwen2.5-7B هنگام اولین اجرا چند گیگابایت دانلود می‌شود و برای
-#        اجرای روان به GPU و RAM کافی نیاز دارد (روی CPU بسیار کند است).
+#
+# ترتیب عمدیِ مراحل (برای مقاوم‌بودن در برابر قطعی اینترنت هنگام دانلود مدل):
+#   ۱) نصب فقط huggingface_hub (سبک)
+#   ۲) «دانلود مدل‌ها قبل از هر چیز دیگر» با BuildKit cache mount
+#   ۳) سپس نصب وابستگی‌های سنگین (torch و ...) و در آخر کپی کد
+#
+# اگر اتصال وسط دانلود قطع شود، به‌لطف --mount=type=cache فایل‌های دانلودشده در
+# کش پایدار می‌مانند و build بعدی از همان نقطه ادامه می‌دهد (resume)، نه از صفر.
+# این یعنی نصب طولانی torch هم بیهوده تکرار نمی‌شود چون بعد از دانلود قرار دارد.
+#
+# مدل‌های دانلودشده هنگام build:
+#   ۱) LLM:      Qwen/Qwen2.5-7B-Instruct  -> /app/models/Qwen2.5-7B-Instruct
+#   ۲) Embedder: heydariAI/persian-embeddings -> کش HuggingFace داخل ایمیج
+# هشدار: Qwen2.5-7B هنگام دانلود ~۱۵ گیگابایت است و برای اجرای روان به GPU و
+#        RAM زیاد نیاز دارد (روی CPU بسیار کند و سنگین است).
+#
+# نیازمند BuildKit (در نسخه‌های جدید Docker و docker compose پیش‌فرض فعال است).
 # ===========================================================
 FROM python:3.11-slim
 
-# وابستگی‌های سیستمی:
+WORKDIR /app
+
+# ۱) ابزار سبک دانلود مدل (بدون torch). جدا نگه داشته شده تا دانلود مدل بتواند
+#    قبل از نصب وابستگی‌های سنگین انجام شود.
+RUN pip install --no-cache-dir huggingface_hub
+
+# ۲) دانلود مدل‌ها «قبل از هر چیز دیگر». blobها در /tmp/hf (cache mount) می‌مانند
+#    تا اگر دانلود نصفه قطع شد، build بعدی از همان‌جا ادامه دهد. در پایان فایل‌ها
+#    به داخل ایمیج کپی می‌شوند (cache mount خودش در ایمیج نهایی باقی نمی‌ماند).
+# توکن HuggingFace به‌صورت BuildKit secret تزریق می‌شود (داخل ایمیج بِیک نمی‌شود).
+# اختیاری است: اگر توکن ندهی، دانلودِ این مدل‌های عمومی به‌صورت ناشناس انجام می‌شود.
+RUN --mount=type=cache,target=/tmp/hf \
+    --mount=type=secret,id=hf_token \
+    HF_HOME=/tmp/hf \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    HF_HUB_DISABLE_XET=1 \
+    HF_HUB_DOWNLOAD_TIMEOUT=60 \
+    python - <<'PY'
+import os, glob, shutil
+from huggingface_hub import snapshot_download
+
+print(">>> [1/2] در حال دانلود LLM: Qwen/Qwen2.5-7B-Instruct ...", flush=True)
+qwen = snapshot_download(repo_id="Qwen/Qwen2.5-7B-Instruct")
+os.makedirs("/app/models", exist_ok=True)
+# کپی فایل‌های واقعی (نه symlink) به مسیری که کد از آن می‌خواند (llm_script_final.py:52)
+shutil.copytree(qwen, "/app/models/Qwen2.5-7B-Instruct", dirs_exist_ok=True)
+
+print(">>> [2/2] در حال دانلود embedder: heydariAI/persian-embeddings ...", flush=True)
+snapshot_download(repo_id="heydariAI/persian-embeddings")
+# کپی کش embedder به مسیر کش پیش‌فرض ایمیج تا هنگام اجرا پیدا شود
+dst = "/root/.cache/huggingface/hub"
+os.makedirs(dst, exist_ok=True)
+for d in glob.glob("/tmp/hf/hub/models--heydariAI--*"):
+    shutil.copytree(d, os.path.join(dst, os.path.basename(d)),
+                    symlinks=True, dirs_exist_ok=True)
+
+print(">>> دانلود و کش هر دو مدل با موفقیت کامل شد", flush=True)
+PY
+
+# ۳) وابستگی‌های سیستمی:
 #   poppler-utils            -> pdf2image (تبدیل PDF به تصویر)
 #   tesseract-ocr + fas      -> OCR فارسی
 #   libgl1 / libglib2.0-0    -> opencv
@@ -22,13 +76,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
-# نصب وابستگی‌های پایتون (لایهٔ جداگانه برای استفاده از کش داکر)
+# ۴) وابستگی‌های سنگین پایتون (torch و ...) — بعد از دانلود مدل تا قطعیِ شبکه
+#    باعث تکرار این مرحلهٔ طولانی نشود.
 COPY requirements-full.txt .
 RUN pip install --no-cache-dir -r requirements-full.txt
 
-# کد سرور و فایل پنل ادمین
+# ۵) کد سرور و فایل پنل ادمین
 COPY llm_script_final.py .
 COPY admin_panel.html .
 

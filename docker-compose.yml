@@ -3,7 +3,9 @@
 #   ۱) نسخهٔ سبک (فقط /ask + ورود + تب پیام‌ها) — سریع:
 #        docker compose up --build
 #
-#   ۲) نسخهٔ کامل (RAG + مدیریت فایل) — سنگین (torch/faiss + دانلود مدل ۷B):
+#   ۲) نسخهٔ کامل (RAG + مدیریت فایل) — سنگین (torch/faiss). مدل‌ها (Qwen2.5-7B
+#      ~۱۵گیگ و embedder ~۲.۳گیگ) «هنگام build» دانلود می‌شوند، پس بار اول build
+#      طول می‌کشد ولی اجرا سریع و بدون دانلود است. به GPU/RAM زیاد نیاز است:
 #        docker compose up --build app-full
 #
 # هر دو روی پورت 8000 هستند ولی هم‌زمان اجرا نمی‌شوند (نسخهٔ کامل با profile جدا
@@ -34,6 +36,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.full
+      # توکن HuggingFace هنگام build به‌صورت secret منتقل می‌شود (در ایمیج بِیک نمی‌شود).
+      secrets:
+        - hf_token
     ports:
       - "8000:8000"
     environment:
@@ -47,7 +52,8 @@ services:
     volumes:
       # فایل‌های آپلودی روی هاست بمانند (هنگام استارت همه به RAG اضافه می‌شوند)
       - ./doc:/app/doc
-      # کش مدل‌های HuggingFace تا با هر بار اجرا دوباره دانلود نشود
+      # کش مدل‌های HuggingFace. مدل‌ها هنگام build داخل ایمیج دانلود شده‌اند؛ این
+      # volume در اولین اجرا از محتوای ایمیج پر می‌شود و کش را بین اجراها نگه می‌دارد.
       - hf_cache:/root/.cache/huggingface
     depends_on:
       db:
@@ -76,3 +82,13 @@ services:
 volumes:
   db_data:
   hf_cache:
+
+# توکن HuggingFace برای دانلود مدل‌ها هنگام build.
+# روش پیش‌فرض: متغیّر محیطی HF_TOKEN را ست کن، مثلاً:
+#     export HF_TOKEN=hf_xxxxxxxxxxxxxxxx
+#     docker compose up --build app-full
+# روش جایگزین (فایل): خط environment زیر را کامنت کن و به‌جایش از file استفاده کن:
+#     file: ./hf_token.txt
+secrets:
+  hf_token:
+    environment: HF_TOKEN

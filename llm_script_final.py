@@ -49,7 +49,7 @@ import mysql.connector
 # ===========================================================
 
 embedder = SentenceTransformer("heydariAI/persian-embeddings")
-model_name = "Qwen/Qwen2.5-7B-Instruct"
+model_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "Qwen2.5-7B-Instruct")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
     model_name,

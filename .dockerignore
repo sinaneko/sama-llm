@@ -4,5 +4,7 @@ __pycache__/
 .DS_Store
 doc/
 frontend/
+# مدل‌ها هنگام build داخل ایمیج دانلود می‌شوند؛ پوشهٔ محلی نباید در build context برود.
+models/
 # نکته: llm_script_final.py عمداً اینجا نیست تا Dockerfile.full بتواند آن را COPY کند.
 # (ایمیج سبک app_ask فقط app_ask.py را COPY می‌کند، پس این فایل واردش نمی‌شود.)
