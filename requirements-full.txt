@@ -12,9 +12,13 @@ python-multipart          # لازم برای UploadFile در Endpoint /upload
 websockets
 
 # ----- ML / هوش مصنوعی -----
-torch                     # برای GPU، نسخهٔ CUDA مناسب را جداگانه نصب کنید
-transformers
+# هشدار: AutoAWQ از مه ۲۰۲۵ منسوخ (deprecated) است و نسخه‌های جدیدتر transformers
+# آن را می‌شکنند. این نسخه‌ها روی «آخرین ترکیب تست‌شدهٔ رسمی AutoAWQ» پین شده‌اند تا
+# اجرا ۱۰۰٪ پایدار بماند. این مجموعه را بدون تست هم‌زمان ارتقا ندهید.
+torch==2.6.0              # wheel پیش‌فرض PyPI برای 2.6.0 روی لینوکس x86_64 همان cu124 است
+transformers==4.51.3      # آخرین نسخهٔ سازگار با autoawq (در این نسخه torch_dtype هنوز معتبر است)
 accelerate                # لازم برای device_map="auto"
+autoawq==0.2.9            # آخرین نسخهٔ AutoAWQ؛ اجرای AWQ 4-bit (روی دیسک ~۵ گیگ، در ۸ گیگ VRAM جا می‌شود)
 sentence-transformers
 faiss-cpu
 

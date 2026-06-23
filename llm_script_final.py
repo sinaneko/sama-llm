@@ -5,6 +5,7 @@ Persian document question-answering system using Qwen2.5-7B and FAISS
 
 # ===== Installation (run once before starting) =====
 # pip install transformers accelerate gradio websockets fastapi uvicorn
+# pip install "torch==2.6.0" "transformers==4.51.3" "autoawq==0.2.9"   # ترکیب تست‌شدهٔ AWQ (AutoAWQ منسوخ است؛ نسخه‌ها را pin نگه دارید)
 # pip install faiss-cpu sentence-transformers
 # pip install opencv-python numpy pytesseract pdf2image
 # pip install opencv-python-headless arabic-reshaper pdfplumber python-bidi
@@ -50,7 +51,9 @@ import mysql.connector
 # ===========================================================
 
 embedder = SentenceTransformer("heydariAI/persian-embeddings")
-model_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "Qwen2.5-7B-Instruct")
+# نسخهٔ از پیش‌کوانتایز‌شدهٔ رسمی Qwen (AWQ 4-bit): روی دیسک ~۵ گیگ و روی کارت ۸ گیگ جا می‌شود.
+# transformers کوانتیزیشن را خودکار از config مدل تشخیص می‌دهد؛ کد اضافه لازم نیست.
+model_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "Qwen2.5-7B-Instruct-AWQ")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
     model_name,

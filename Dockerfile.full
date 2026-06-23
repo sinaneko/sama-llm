@@ -2,9 +2,13 @@
 # ===========================================================
 # ایمیج کامل برای اجرای llm_script_final.py (RAG + LLM + OCR + Gradio)
 # ساخت:  docker build -f Dockerfile.full -t llm-full .
-# اجرا :  docker run -d -p 8000:8000 \
+# اجرا :  docker run -d --gpus all -p 8000:8000 \
 #            -e LLM_DB_HOST=host.docker.internal \
 #            --name llm-full llm-full
+#
+# ⚠️ پرچم --gpus all الزامی است: مدل AWQ 4-bit (autoawq) فقط روی GPU انویدیا اجرا
+#    می‌شود. روی هاست باید درایور NVIDIA و NVIDIA Container Toolkit
+#    (nvidia-container-toolkit) نصب باشد، وگرنه کانتینر هنگام بارگذاری مدل کرش می‌کند.
 #
 # ترتیب عمدیِ مراحل (برای مقاوم‌بودن در برابر قطعی اینترنت هنگام دانلود مدل):
 #   ۱) نصب فقط huggingface_hub (سبک)
@@ -16,14 +20,16 @@
 # این یعنی نصب طولانی torch هم بیهوده تکرار نمی‌شود چون بعد از دانلود قرار دارد.
 #
 # مدل‌های دانلودشده هنگام build:
-#   ۱) LLM:      Qwen/Qwen2.5-7B-Instruct  -> /app/models/Qwen2.5-7B-Instruct
+#   ۱) LLM:      Qwen/Qwen2.5-7B-Instruct-AWQ -> /app/models/Qwen2.5-7B-Instruct-AWQ
 #   ۲) Embedder: heydariAI/persian-embeddings -> کش HuggingFace داخل ایمیج
-# هشدار: Qwen2.5-7B هنگام دانلود ~۱۵ گیگابایت است و برای اجرای روان به GPU و
-#        RAM زیاد نیاز دارد (روی CPU بسیار کند و سنگین است).
+# نکته: نسخهٔ AWQ از پیش‌کوانتایز‌شده (۴ بیتی) است؛ هنگام دانلود ~۵ گیگابایت است و
+#       روی کارت گرافیک ۸ گیگ اجرا می‌شود. نیازمند GPU انویدیا است.
 #
 # نیازمند BuildKit (در نسخه‌های جدید Docker و docker compose پیش‌فرض فعال است).
 # ===========================================================
-FROM python:3.11-slim
+# پلتفرم روی linux/amd64 ثابت شده تا اگر build روی Mac/ARM انجام شد، wheelهای
+# torch/autoawq نسخهٔ x86_64+CUDA نصب شوند (سرور GPU همیشه x86_64 است).
+FROM --platform=linux/amd64 python:3.11-slim
 
 WORKDIR /app
 
@@ -46,11 +52,11 @@ RUN --mount=type=cache,target=/tmp/hf \
 import os, glob, shutil
 from huggingface_hub import snapshot_download
 
-print(">>> [1/2] در حال دانلود LLM: Qwen/Qwen2.5-7B-Instruct ...", flush=True)
-qwen = snapshot_download(repo_id="Qwen/Qwen2.5-7B-Instruct")
+print(">>> [1/2] در حال دانلود LLM: Qwen/Qwen2.5-7B-Instruct-AWQ ...", flush=True)
+qwen = snapshot_download(repo_id="Qwen/Qwen2.5-7B-Instruct-AWQ")
 os.makedirs("/app/models", exist_ok=True)
-# کپی فایل‌های واقعی (نه symlink) به مسیری که کد از آن می‌خواند (llm_script_final.py:52)
-shutil.copytree(qwen, "/app/models/Qwen2.5-7B-Instruct", dirs_exist_ok=True)
+# کپی فایل‌های واقعی (نه symlink) به مسیری که کد از آن می‌خواند (llm_script_final.py)
+shutil.copytree(qwen, "/app/models/Qwen2.5-7B-Instruct-AWQ", dirs_exist_ok=True)
 
 print(">>> [2/2] در حال دانلود embedder: heydariAI/persian-embeddings ...", flush=True)
 snapshot_download(repo_id="heydariAI/persian-embeddings")

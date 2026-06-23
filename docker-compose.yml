@@ -60,6 +60,15 @@ services:
       # نکته: کش مدل‌ها عمداً به‌صورت volume mount نمی‌شود. مدل‌ها هنگام build داخل
       # ایمیج بِیک شده‌اند؛ اگر volume خالی/ناقص روی /root/.cache/huggingface سوار شود
       # کشِ کاملِ ایمیج را سایه می‌کند و اپ سعی می‌کند مدل را دوباره دانلود کند.
+    # دسترسی به GPU انویدیا — الزامی برای اجرای مدل AWQ 4-bit (autoawq فقط روی GPU انویدیا).
+    # نیازمند نصب NVIDIA Container Toolkit روی هاست. معادلِ compose برای --gpus all.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     depends_on:
       db:
         condition: service_healthy
