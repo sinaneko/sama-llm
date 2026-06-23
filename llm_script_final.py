@@ -16,6 +16,7 @@ import os
 import re
 import time
 import json
+import asyncio
 import shutil
 import secrets
 from threading import Thread
@@ -789,7 +790,13 @@ async def get_all_chunks():
 
 
 async def stream_generator(question: str):
-    contexts, scores, indices, source_info = retrieve_context(question, top_k=5, threshold=0.3)
+    loop = asyncio.get_running_loop()
+
+    # بازیابی context (embedder.encode + جستجوی FAISS) کار سنگین CPU/GPU است؛
+    # روی threadpool اجرا می‌شود تا event loop بلاک نشود و بقیهٔ APIها پاسخگو بمانند.
+    contexts, scores, indices, source_info = await loop.run_in_executor(
+        None, retrieve_context, question, 5, 0.3
+    )
 
     sources = []
     if source_info:
@@ -804,7 +811,10 @@ async def stream_generator(question: str):
         return
 
     prompt = build_prompt(question, contexts)
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    # توکنایز هم blocking است؛ آن را نیز از event loop خارج می‌کنیم.
+    inputs = await loop.run_in_executor(
+        None, lambda: tokenizer(prompt, return_tensors="pt").to(model.device)
+    )
 
     streamer = TextIteratorStreamer(
         tokenizer, skip_prompt=True, skip_special_tokens=True
@@ -825,8 +835,17 @@ async def stream_generator(question: str):
     thread = Thread(target=model.generate, kwargs=generation_kwargs)
     thread.start()
 
+    # مصرف استریمر سینکرون است: هر next() تا آماده‌شدن توکن بعدی روی queue.get()
+    # بلاک می‌شود. اگر مستقیم در این async generator حلقه بزنیم، event loop برای
+    # کل مدت تولید پاسخ قفل می‌شود. پس هر next() را روی threadpool اجرا می‌کنیم تا
+    # event loop بین توکن‌ها آزاد شود و درخواست‌های دیگر سرویس بگیرند.
+    _SENTINEL = object()
+    iterator = iter(streamer)
     generated_text = ""
-    for new_text in streamer:
+    while True:
+        new_text = await loop.run_in_executor(None, next, iterator, _SENTINEL)
+        if new_text is _SENTINEL:
+            break
         generated_text += new_text
         if "\nInformation:" in generated_text:
             break

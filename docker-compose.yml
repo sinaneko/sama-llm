@@ -4,8 +4,8 @@
 #        docker compose up --build
 #
 #   ۲) نسخهٔ کامل (RAG + مدیریت فایل) — سنگین (torch/faiss). مدل‌ها (Qwen2.5-7B
-#      ~۱۵گیگ و embedder ~۲.۳گیگ) «هنگام build» دانلود می‌شوند، پس بار اول build
-#      طول می‌کشد ولی اجرا سریع و بدون دانلود است. به GPU/RAM زیاد نیاز است:
+#      و embedder) «هنگام build» دانلود می‌شوند، پس بار اول build طول می‌کشد ولی
+#      اجرا سریع و بدون دانلود است:
 #        docker compose up --build app-full
 #
 # هر دو روی پورت 8000 هستند ولی هم‌زمان اجرا نمی‌شوند (نسخهٔ کامل با profile جدا
@@ -49,12 +49,17 @@ services:
       LLM_DB_NAME: teamgram
       ADMIN_USERNAME: admin
       ADMIN_PASSWORD: admin1234
+      # مدل‌ها داخل ایمیج بِیک شده‌اند؛ آفلاین کن تا کتابخانه‌ها هنگام لود سراغ
+      # HF Hub نروند و روی پروکسی ناپایدار هنگ نکنند (علت گیرکردنِ استارتاپ).
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_XET: "1"
     volumes:
       # فایل‌های آپلودی روی هاست بمانند (هنگام استارت همه به RAG اضافه می‌شوند)
       - ./doc:/app/doc
-      # کش مدل‌های HuggingFace. مدل‌ها هنگام build داخل ایمیج دانلود شده‌اند؛ این
-      # volume در اولین اجرا از محتوای ایمیج پر می‌شود و کش را بین اجراها نگه می‌دارد.
-      - hf_cache:/root/.cache/huggingface
+      # نکته: کش مدل‌ها عمداً به‌صورت volume mount نمی‌شود. مدل‌ها هنگام build داخل
+      # ایمیج بِیک شده‌اند؛ اگر volume خالی/ناقص روی /root/.cache/huggingface سوار شود
+      # کشِ کاملِ ایمیج را سایه می‌کند و اپ سعی می‌کند مدل را دوباره دانلود کند.
     depends_on:
       db:
         condition: service_healthy
@@ -81,7 +86,6 @@ services:
 
 volumes:
   db_data:
-  hf_cache:
 
 # توکن HuggingFace برای دانلود مدل‌ها هنگام build.
 # روش پیش‌فرض: متغیّر محیطی HF_TOKEN را ست کن، مثلاً:
