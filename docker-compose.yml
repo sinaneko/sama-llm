@@ -3,10 +3,10 @@
 #   ۱) نسخهٔ سبک (فقط /ask + ورود + تب پیام‌ها) — سریع:
 #        docker compose up --build
 #
-#   ۲) نسخهٔ کامل (RAG + مدیریت فایل) — سنگین (torch/faiss). مدل‌ها (Qwen2.5-7B
-#      و embedder) «هنگام build» دانلود می‌شوند، پس بار اول build طول می‌کشد ولی
-#      اجرا سریع و بدون دانلود است:
+#   ۲) نسخهٔ کامل (RAG + مدیریت فایل). LLM روی سرویس «ollama» با GPU اجرا می‌شود و
+#      embedder روی CPU داخل app-full. مدل LLM (qwen2.5:7b) بار اول خودکار pull می‌شود:
 #        docker compose up --build app-full
+#      (سرویس ollama و db به‌صورت وابستگی خودکار بالا می‌آیند.)
 #
 # هر دو روی پورت 8000 هستند ولی هم‌زمان اجرا نمی‌شوند (نسخهٔ کامل با profile جدا
 # شده تا «docker compose up» بدون آرگومان فقط نسخهٔ سبک را بالا بیاورد).
@@ -49,19 +49,29 @@ services:
       LLM_DB_NAME: teamgram
       ADMIN_USERNAME: admin
       ADMIN_PASSWORD: admin1234
-      # مدل‌ها داخل ایمیج بِیک شده‌اند؛ آفلاین کن تا کتابخانه‌ها هنگام لود سراغ
-      # HF Hub نروند و روی پروکسی ناپایدار هنگ نکنند (علت گیرکردنِ استارتاپ).
+      # embedder داخل ایمیج بِیک شده؛ آفلاین کن تا هنگام لود سراغ HF Hub نرود.
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       HF_HUB_DISABLE_XET: "1"
+      # آدرس سرویس Ollama (LLM) و نام مدل. اپ هنگام استارت مدل را در صورت نبود pull می‌کند.
+      OLLAMA_HOST: "http://ollama:11434"
+      OLLAMA_MODEL: "qwen2.5:7b"
     volumes:
       # فایل‌های آپلودی روی هاست بمانند (هنگام استارت همه به RAG اضافه می‌شوند)
       - ./doc:/app/doc
-      # نکته: کش مدل‌ها عمداً به‌صورت volume mount نمی‌شود. مدل‌ها هنگام build داخل
-      # ایمیج بِیک شده‌اند؛ اگر volume خالی/ناقص روی /root/.cache/huggingface سوار شود
-      # کشِ کاملِ ایمیج را سایه می‌کند و اپ سعی می‌کند مدل را دوباره دانلود کند.
-    # دسترسی به GPU انویدیا — الزامی برای اجرای مدل AWQ 4-bit (autoawq فقط روی GPU انویدیا).
-    # نیازمند نصب NVIDIA Container Toolkit روی هاست. معادلِ compose برای --gpus all.
+    # این کانتینر GPU نمی‌خواهد (embedder روی CPU)؛ GPU فقط روی سرویس ollama است.
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+
+  # سرویس LLM. مدل qwen2.5:7b روی این کانتینر و با GPU انویدیا اجرا می‌شود.
+  # روی کارت‌های Blackwell (سری RTX 50 / RTX PRO) به‌صورت خودکار کار می‌کند.
+  ollama:
+    profiles: ["full"]
+    image: ollama/ollama:latest
+    # دسترسی به GPU انویدیا — نیازمند نصب NVIDIA Container Toolkit روی هاست.
     deploy:
       resources:
         reservations:
@@ -69,9 +79,18 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    depends_on:
-      db:
-        condition: service_healthy
+    volumes:
+      # مدل‌های دانلودشدهٔ Ollama روی volume بمانند تا با هر restart دوباره دانلود نشوند.
+      - ollama_data:/root/.ollama
+    # سلامت سرویس: app-full تا وقتی Ollama واقعاً پاسخگو نشده بالا نمی‌آید (شرط service_healthy).
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    # (اختیاری) اگر خواستی از بیرونِ داکر هم به Ollama وصل شوی، این را باز کن:
+    # ports:
+    #   - "11434:11434"
 
   db:
     image: mysql:8.0
@@ -95,6 +114,7 @@ services:
 
 volumes:
   db_data:
+  ollama_data:
 
 # توکن HuggingFace برای دانلود مدل‌ها هنگام build.
 # روش پیش‌فرض: متغیّر محیطی HF_TOKEN را ست کن، مثلاً:

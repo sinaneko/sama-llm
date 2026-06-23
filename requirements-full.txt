@@ -2,7 +2,11 @@
 # وابستگی‌های کامل برای اجرای llm_script_final.py
 # (نسخهٔ سنگین: RAG + LLM + OCR + Gradio)
 # نصب: pip install -r requirements-full.txt
-# هشدار: torch و مدل Qwen2.5-7B حجیم‌اند و برای اجرا GPU/RAM زیاد لازم است.
+#
+# معماری: LLM (qwen2.5:7b) روی سرویس جدا Ollama با GPU اجرا می‌شود؛ این کانتینر فقط
+# embedder را روی CPU اجرا می‌کند. پس اینجا torch نسخهٔ CPU کافی است و نیازی به
+# torch مخصوص GPU/CUDA (و دردسر سازگاری Blackwell) نیست.
+# ⚠️ torch به‌صورت CPU در Dockerfile.full جداگانه نصب می‌شود (index رسمی PyTorch CPU).
 # ===========================================================
 
 # ----- API / وب‌سرور -----
@@ -12,14 +16,9 @@ python-multipart          # لازم برای UploadFile در Endpoint /upload
 websockets
 
 # ----- ML / هوش مصنوعی -----
-# هشدار: AutoAWQ از مه ۲۰۲۵ منسوخ (deprecated) است و نسخه‌های جدیدتر transformers
-# آن را می‌شکنند. این نسخه‌ها روی «آخرین ترکیب تست‌شدهٔ رسمی AutoAWQ» پین شده‌اند تا
-# اجرا ۱۰۰٪ پایدار بماند. این مجموعه را بدون تست هم‌زمان ارتقا ندهید.
-torch==2.6.0              # wheel پیش‌فرض PyPI برای 2.6.0 روی لینوکس x86_64 همان cu124 است
-transformers==4.51.3      # آخرین نسخهٔ سازگار با autoawq (در این نسخه torch_dtype هنوز معتبر است)
-accelerate                # لازم برای device_map="auto"
-autoawq==0.2.9            # آخرین نسخهٔ AutoAWQ؛ اجرای AWQ 4-bit (روی دیسک ~۵ گیگ، در ۸ گیگ VRAM جا می‌شود)
-sentence-transformers
+ollama                    # کلاینت LLM؛ به سرویس Ollama (GPU) وصل می‌شود
+transformers              # وابستگی sentence-transformers (روی CPU)
+sentence-transformers     # embedder فارسی (روی CPU اجرا می‌شود)
 faiss-cpu
 
 # ----- OCR و پردازش فایل -----

@@ -4,9 +4,11 @@ Persian document question-answering system using Qwen2.5-7B and FAISS
 """
 
 # ===== Installation (run once before starting) =====
-# pip install transformers accelerate gradio websockets fastapi uvicorn
-# pip install "torch==2.6.0" "transformers==4.51.3" "autoawq==0.2.9"   # ترکیب تست‌شدهٔ AWQ (AutoAWQ منسوخ است؛ نسخه‌ها را pin نگه دارید)
-# pip install faiss-cpu sentence-transformers
+# LLM روی سرویس Ollama اجرا می‌شود (جدا)؛ این اسکریپت فقط به آن وصل می‌شود.
+#   - نصب Ollama و مدل:  ollama pull qwen2.5:7b   (روی ماشین دارای GPU انویدیا)
+# pip install ollama gradio websockets fastapi uvicorn
+# pip install torch --index-url https://download.pytorch.org/whl/cpu   # torch CPU برای embedder
+# pip install transformers faiss-cpu sentence-transformers
 # pip install opencv-python numpy pytesseract pdf2image
 # pip install opencv-python-headless arabic-reshaper pdfplumber python-bidi
 # pip install mysql-connector-python
@@ -20,14 +22,12 @@ import json
 import asyncio
 import shutil
 import secrets
-from threading import Thread
 from typing import List, Dict, Any
 from datetime import datetime
 
 # ===== ML / AI =====
-import torch
 import faiss
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+import ollama  # کلاینت LLM؛ مدل qwen2.5:7b روی سرویس Ollama (GPU) اجرا می‌شود
 from sentence_transformers import SentenceTransformer
 
 # ===== OCR / Files =====
@@ -50,16 +50,58 @@ import mysql.connector
 # Model & Embedder Initialization
 # ===========================================================
 
-embedder = SentenceTransformer("heydariAI/persian-embeddings")
-# نسخهٔ از پیش‌کوانتایز‌شدهٔ رسمی Qwen (AWQ 4-bit): روی دیسک ~۵ گیگ و روی کارت ۸ گیگ جا می‌شود.
-# transformers کوانتیزیشن را خودکار از config مدل تشخیص می‌دهد؛ کد اضافه لازم نیست.
-model_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "Qwen2.5-7B-Instruct-AWQ")
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.float16,
-    device_map="auto"
-)
+# Embedder روی CPU اجرا می‌شود تا این کانتینر اصلاً به GPU/torch مخصوص Blackwell نیاز نداشته باشد.
+# مدل embedding کوچک است و روی CPU به‌اندازهٔ کافی سریع است.
+embedder = SentenceTransformer("heydariAI/persian-embeddings", device="cpu")
+
+# LLM روی سرویس جدا Ollama (با GPU) اجرا می‌شود. این کانتینر فقط از طریق شبکه به آن وصل می‌شود.
+# Ollama روی کارت‌های Blackwell به‌صورت خودکار کار می‌کند و خودش CUDA را مدیریت می‌کند.
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+ollama_client = ollama.Client(host=OLLAMA_HOST)
+
+# پارامترهای تولید (معادل تنظیمات قبلی transformers روی Ollama).
+OLLAMA_OPTIONS = {
+    "num_predict": 1024,   # = max_new_tokens
+    "temperature": 0.3,
+    "top_p": 0.95,
+    "top_k": 50,
+    "repeat_penalty": 1.0,
+}
+
+
+def _wait_for_ollama(retries: int = 30, delay: float = 2.0) -> bool:
+    """منتظر آماده‌شدن سرویس Ollama می‌ماند (مثلاً وقتی هم‌زمان با اپ بالا می‌آید)."""
+    for attempt in range(1, retries + 1):
+        try:
+            ollama_client.list()
+            return True
+        except Exception:
+            if attempt == 1:
+                print("⏳ در انتظار آماده‌شدن سرویس Ollama...")
+            time.sleep(delay)
+    return False
+
+
+def ensure_ollama_model(model_tag: str = None) -> None:
+    """در صورت نبودِ مدل روی سرویس Ollama، آن را یک‌بار دانلود (pull) می‌کند.
+    ابتدا منتظر آماده‌شدن سرویس می‌ماند تا در شرایط رقابتی استارت، مدل از قلم نیفتد."""
+    model_tag = model_tag or OLLAMA_MODEL
+
+    if not _wait_for_ollama():
+        print("⚠️  سرویس Ollama در دسترس نشد؛ مدل بعداً هنگام اولین درخواست تلاش می‌شود.")
+        return
+
+    try:
+        local = {m.get("model") for m in ollama_client.list().get("models", [])}
+        if model_tag in local or any(str(t).startswith(model_tag) for t in local):
+            print(f"✅ مدل Ollama موجود است: {model_tag}")
+            return
+        print(f"🔄 در حال دانلود مدل Ollama: {model_tag} (بار اول کمی طول می‌کشد)...")
+        ollama_client.pull(model_tag)
+        print(f"✅ دانلود مدل Ollama کامل شد: {model_tag}")
+    except Exception as e:
+        print(f"⚠️  بررسی/دانلود مدل Ollama ناموفق بود (هنگام درخواست دوباره تلاش می‌شود): {e}")
 
 
 # ===========================================================
@@ -600,31 +642,14 @@ def ask_with_rag_gradio(question, history):
         return
 
     prompt = build_prompt(question, contexts)
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
-    streamer = TextIteratorStreamer(
-        tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=True
-    )
-
-    generation_kwargs = dict(
-        **inputs,
-        streamer=streamer,
-        max_new_tokens=1024,
-        temperature=0.3,
-        top_p=0.95,
-        top_k=50,
-        repetition_penalty=1.0,
-        no_repeat_ngram_size=14,
-        do_sample=True
-    )
-
-    thread = Thread(target=model.generate, kwargs=generation_kwargs)
-    thread.start()
 
     generated_text = ""
-    for new_text in streamer:
+    for chunk in ollama_client.generate(
+        model=OLLAMA_MODEL, prompt=prompt, stream=True, options=OLLAMA_OPTIONS
+    ):
+        new_text = chunk.get("response", "")
+        if not new_text:
+            continue
         generated_text += new_text
 
         if "\nInformation:" in generated_text:
@@ -814,41 +839,28 @@ async def stream_generator(question: str):
         return
 
     prompt = build_prompt(question, contexts)
-    # توکنایز هم blocking است؛ آن را نیز از event loop خارج می‌کنیم.
-    inputs = await loop.run_in_executor(
-        None, lambda: tokenizer(prompt, return_tensors="pt").to(model.device)
-    )
 
-    streamer = TextIteratorStreamer(
-        tokenizer, skip_prompt=True, skip_special_tokens=True
-    )
+    # استریم پاسخ از Ollama. کلاینت Ollama سینکرون است و هر next() تا آماده‌شدن توکن
+    # بعدی بلاک می‌شود؛ پس مثل قبل هر next() را روی threadpool اجرا می‌کنیم تا event loop
+    # بین توکن‌ها آزاد بماند و بقیهٔ APIها پاسخگو باشند.
+    def _start_stream():
+        return ollama_client.generate(
+            model=OLLAMA_MODEL, prompt=prompt, stream=True, options=OLLAMA_OPTIONS
+        )
 
-    generation_kwargs = dict(
-        **inputs,
-        streamer=streamer,
-        max_new_tokens=1024,
-        temperature=0.3,
-        top_p=0.95,
-        top_k=50,
-        repetition_penalty=1.0,
-        no_repeat_ngram_size=14,
-        do_sample=True
-    )
+    iterator = await loop.run_in_executor(None, _start_stream)
 
-    thread = Thread(target=model.generate, kwargs=generation_kwargs)
-    thread.start()
-
-    # مصرف استریمر سینکرون است: هر next() تا آماده‌شدن توکن بعدی روی queue.get()
-    # بلاک می‌شود. اگر مستقیم در این async generator حلقه بزنیم، event loop برای
-    # کل مدت تولید پاسخ قفل می‌شود. پس هر next() را روی threadpool اجرا می‌کنیم تا
-    # event loop بین توکن‌ها آزاد شود و درخواست‌های دیگر سرویس بگیرند.
     _SENTINEL = object()
-    iterator = iter(streamer)
     generated_text = ""
     while True:
-        new_text = await loop.run_in_executor(None, next, iterator, _SENTINEL)
-        if new_text is _SENTINEL:
+        chunk = await loop.run_in_executor(None, next, iterator, _SENTINEL)
+        if chunk is _SENTINEL:
             break
+        new_text = chunk.get("response", "")
+        if not new_text:
+            if chunk.get("done"):
+                break
+            continue
         generated_text += new_text
         if "\nInformation:" in generated_text:
             break
@@ -1405,6 +1417,9 @@ async def panel():
 # ===========================================================
 
 if __name__ == "__main__":
+    # اطمینان از وجود مدل روی سرویس Ollama (در صورت نبود، یک‌بار دانلود می‌شود)
+    ensure_ollama_model()
+
     # بارگذاری اسناد موجود از پوشهٔ آپلود و افزودن همهٔ آن‌ها به RAG
     load_existing_documents(language='fas')
 
